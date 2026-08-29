@@ -49,9 +49,23 @@ export interface TaskRecord {
   updatedAt: string;
 }
 
-export interface TaskQueueMessage {
+export interface BookTaskQueueMessage {
+  kind?: "book";
   taskId: string;
 }
+
+export interface TelegramImageQueueMessage {
+  kind: "telegram_image";
+  chatId: string;
+  userId: string;
+  sourceMessageId: number;
+  fileId: string;
+  caption?: string;
+  declaredSizeBytes?: number;
+  mimeType?: string;
+}
+
+export type TaskQueueMessage = BookTaskQueueMessage | TelegramImageQueueMessage;
 
 export interface SourceAdapter {
   name: string;
@@ -79,11 +93,13 @@ export interface Env {
   DB: D1Database;
   FILES: R2Bucket;
   TASK_QUEUE: Queue<TaskQueueMessage>;
+  AI: Ai;
   API_TOKEN: string;
   KINDLE_EMAIL?: string;
   APP_ENV?: string;
   TEMP_OBJECT_TTL_HOURS?: string;
   MAX_CLOUD_FILE_BYTES?: string;
+  MAX_TELEGRAM_IMAGE_BYTES?: string;
   GMAIL_CLIENT_ID?: string;
   GMAIL_CLIENT_SECRET?: string;
   GMAIL_REFRESH_TOKEN?: string;
