@@ -10,6 +10,12 @@ const CANCELLABLE_STATUSES = [
   "staged",
 ] as const;
 
+const ACTIVE_CANCEL_CONTEXT_STATUSES = [
+  ...CANCELLABLE_STATUSES,
+  "delivering",
+  "delivery_unknown",
+] as const;
+
 type CancelOutcome =
   | { outcome: "cancelled"; taskId: string; title: string }
   | { outcome: "too_late"; taskId: string; title: string; status: string }
@@ -161,6 +167,13 @@ function explicitTaskId(text: string): string | undefined {
   return chinese?.[1];
 }
 
+function hasCancelArgument(text: string): boolean {
+  return (
+    /^\/cancel(?:@\w+)?\s+\S+/i.test(text) ||
+    /^(?:取消|撤回)(?:任务)?\s+\S+/u.test(text)
+  );
+}
+
 async function linkedTaskForUser(
   env: Env,
   userId: string,
@@ -174,7 +187,9 @@ async function linkedTaskForUser(
     return row ? String(row.task_id) : null;
   }
 
-  const statusPlaceholders = CANCELLABLE_STATUSES.map((_, index) => `?${index + 2}`).join(", ");
+  const statusPlaceholders = ACTIVE_CANCEL_CONTEXT_STATUSES.map(
+    (_, index) => `?${index + 2}`,
+  ).join(", ");
   const row = await env.DB
     .prepare(
       `SELECT l.task_id
@@ -184,7 +199,7 @@ async function linkedTaskForUser(
        ORDER BY l.created_at DESC
        LIMIT 1`,
     )
-    .bind(userId, ...CANCELLABLE_STATUSES)
+    .bind(userId, ...ACTIVE_CANCEL_CONTEXT_STATUSES)
     .first<Record<string, unknown>>();
   return row ? String(row.task_id) : null;
 }
@@ -261,7 +276,7 @@ function cancellationMessage(result: CancelOutcome): string {
       if (result.status === "delivery_unknown") {
         return `《${result.title}》的投递结果已经无法确认。为避免造成误判，不能标记为已撤回；请检查 Gmail 已发送邮件和 Kindle。`;
       }
-      return `《${result.title}》已经开始 Gmail 投递，当前已无法安全撤回。`;
+      return `《${result.title}》已经进入 Gmail 投递阶段，当前已无法安全撤回。`;
     case "not_cancellable":
       return `《${result.title}》当前状态为 ${result.status}，没有可继续取消的处理。`;
     case "not_found":
@@ -325,13 +340,24 @@ export async function handleTelegramControlWebhook(
     return new Response("ok");
   }
 
+  const targeted = hasCancelArgument(text);
   const requestedTaskId = explicitTaskId(text);
+  if (targeted && !requestedTaskId) {
+    await sendTelegramMessage(
+      env,
+      chatId,
+      "任务 ID 格式不正确。请使用 `/cancel <完整 task-id>`，或直接发送 `/cancel` 取消最近仍在处理的任务。",
+      message.message_id,
+    );
+    return new Response("ok");
+  }
+
   const taskId = await linkedTaskForUser(env, userId, requestedTaskId);
   if (!taskId) {
     await sendTelegramMessage(
       env,
       chatId,
-      requestedTaskId ? "这个任务不存在、不属于你，或已经不能取消。" : "目前没有仍可取消的任务。",
+      requestedTaskId ? "这个任务不存在或不属于你。" : "目前没有仍在处理、可供取消的任务。",
       message.message_id,
     );
     return new Response("ok");
