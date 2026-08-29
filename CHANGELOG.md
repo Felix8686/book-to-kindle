@@ -27,6 +27,11 @@ The project follows Semantic Versioning while it is practical to do so.
 - configurable `MAX_TELEGRAM_IMAGE_BYTES` guardrail (4 MiB default, 6 MiB hard cap)
 - image-caption preferences such as PDF/中文/英文 carried into the normal book task
 - `vision: workers_ai` status in `/health`
+- safe Telegram task cancellation via `/cancel`, `取消`, and `撤回`
+- targeted Telegram cancellation via `/cancel <task-id>` with requester ownership checks
+- authenticated HTTP cancellation endpoint at `POST /api/v1/tasks/:id/cancel`
+- terminal `cancelled` task state without requiring a schema migration
+- dedicated cancellation semantics documentation
 
 ### Architecture / reliability
 - vision inference runs in Queue consumers instead of blocking the Telegram webhook
@@ -35,11 +40,17 @@ The project follows Semantic Versioning while it is practical to do so.
 - the vision entry layer does not persist source images in R2 or D1
 - image ambiguity is resolved before creating the normal book task; source-edition ambiguity remains a separate later step
 - Telegram image choice callbacks are bound to the original user and chat
+- cancellation is accepted before Gmail delivery begins and rejected once the workflow has entered `delivering`, `delivery_unknown`, or `delivered`
+- in-flight Queue work cannot overwrite a task already marked `cancelled`
+- the workflow re-checks cancellation around search, download, R2 staging, and the final Gmail-delivery boundary
+- temporary R2 objects are deleted best-effort when cancellation wins during staging
+- cancelled tasks unwind without being converted into generic `failed` retries
 
 ### Documentation
 - documented the one-time Meta model license/AUP prerequisite
 - documented Workers AI Free daily allocation and image-size guardrails
 - added image acceptance tests to Telegram/deployment guidance
+- documented why Gmail/Kindle delivery cannot be truthfully "recalled" once transmission has started
 
 ## [0.3.0] - 2026-08-29
 
