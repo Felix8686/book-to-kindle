@@ -1,150 +1,92 @@
 # Telegram entrypoint
 
-Book to Kindle v0.4 exposes a Telegram Bot webhook directly on the Cloudflare Worker. Text requests and images both enter the same book workflow.
-
-```text
-Telegram user
-    |
-    +--> text request -------------------+
-    |                                    |
-    +--> photo / image file              |
-             |                           |
-             v                           |
-       Queue vision job                  |
-             |                           |
-       Workers AI vision                 |
-             |                           |
-       title / author                    |
-             +---------------------------+
-                         |
-                         v
-                   D1 book task
-                         |
-                         v
-                       Queue
-                         |
-                         v
-                 normal book workflow
-                         |
-                         v
-                       Kindle
-```
+Book to Kindle v0.5 exposes a Telegram Bot webhook directly on the Cloudflare Worker. Text requests and images both enter the same book workflow.
 
 Hermes is not required for this path. The Telegram bot remains usable while the user's PC is off.
 
 ## 1. Required Telegram secrets
 
-Create a bot with Telegram's official `@BotFather`, then configure:
+Configure:
 
 ```bash
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
-```
-
-Generate `TELEGRAM_WEBHOOK_SECRET` with characters accepted by Telegram (`A-Z`, `a-z`, `0-9`, `_`, `-`). Example:
-
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+npx wrangler secret put TELEGRAM_ALLOWED_USER_IDS
 ```
 
 Never commit these values.
 
 ## 2. Apply migrations
 
-Telegram text entry uses `0004_telegram_entry.sql`.
-Telegram update idempotency uses `0005_telegram_update_idempotency.sql`.
-Image recognition choices use `0006_telegram_image_choices.sql`.
+Telegram-related migrations:
+
+```text
+0004_telegram_entry.sql
+0005_telegram_update_idempotency.sql
+0006_telegram_image_choices.sql
+0007_user_settings.sql
+```
+
+Apply with:
 
 ```bash
 npm run db:migrate:remote
 ```
 
-For local development:
+Task cancellation uses the existing free-form `tasks.status` column and does not require a dedicated schema migration.
 
-```bash
-npm run db:migrate:local
-```
+## 3. Default book language
 
-Task cancellation uses the existing free-form `tasks.status` column and does not require an additional migration.
-
-## 3. Workers AI binding
-
-`wrangler.toml` contains:
-
-```toml
-[ai]
-binding = "AI"
-```
-
-The current vision model is:
+A Telegram user with no saved settings automatically gets:
 
 ```text
-@cf/meta/llama-3.2-11b-vision-instruct
+默认书籍语言：中文优先
+默认格式：EPUB
 ```
 
-Cloudflare requires accepting Meta's model license once before first use. Complete that account-level step before image testing. The model is called through the Worker AI binding; no separate VPS or GPU service is required.
+No explicit initialization row is required. Missing settings are interpreted as `zh` + `epub`.
 
-Workers AI currently includes a free daily allocation. Image recognition is deliberately only invoked when an authorized user actually sends an image.
-
-## 4. Image-size guardrail
-
-The default configuration is:
-
-```toml
-MAX_TELEGRAM_IMAGE_BYTES = "4194304"
-```
-
-That is 4 MiB. Code also enforces a hard 6 MiB ceiling.
-
-This keeps base64 conversion and vision inference inside a conservative Worker memory/CPU envelope. Telegram's normal photo mode usually compresses images below this limit.
-
-Supported image inputs:
-
-- Telegram photos;
-- JPEG image documents;
-- PNG image documents;
-- WebP image documents.
-
-Other files are rejected instead of being passed blindly to Workers AI.
-
-## 5. Deploy and register webhook
-
-```bash
-npm run deploy
-```
-
-Webhook URL:
+Language priority:
 
 ```text
-https://<worker>.workers.dev/telegram/webhook
+explicit language in the current request
+> persistent Telegram user setting
+> system default zh
 ```
 
-Register only:
+Chinese preferred is **not** Chinese-only. If no suitable Chinese download candidate exists, the normal workflow can fall back to another language.
 
-- `message`
-- `callback_query`
+## 4. Settings commands
 
-Use the same `TELEGRAM_WEBHOOK_SECRET` as Telegram's `secret_token`.
-
-## 6. Bootstrap the user allowlist
-
-Before the allowlist is configured, `/whoami` remains available.
-
-Send:
+Show settings:
 
 ```text
-/whoami
+/settings
 ```
 
-Then configure the returned numeric ID:
+Set persistent language:
 
-```bash
-npx wrangler secret put TELEGRAM_ALLOWED_USER_IDS
+```text
+/language zh
+/language en
 ```
 
-Multiple IDs may be comma-separated. If the allowlist is empty, normal task creation and image recognition remain denied by default.
+Chinese aliases:
 
-## 7. Text usage
+```text
+/语言 中文
+/语言 英文
+```
+
+A one-off request can override the saved default:
+
+```text
+Thinking, Fast and Slow 英文
+```
+
+If the saved default is Chinese, this task prefers English but the next task returns to Chinese preference.
+
+## 5. Text requests
 
 Examples:
 
@@ -165,32 +107,83 @@ Commands:
 ```text
 /send <书名>
 /status
+/settings
+/language zh
+/language en
 /cancel
 /cancel <task-id>
 /whoami
 /help
 ```
 
-Chinese cancellation shortcuts are also accepted:
+## 6. Image requests
+
+Supported inputs:
+
+- Telegram photos;
+- JPEG image documents;
+- PNG image documents;
+- WebP image documents.
+
+The webhook enqueues the vision job instead of waiting for Workers AI synchronously.
+
+After vision identifies the book, the normal work resolver runs. This means an English cover does **not** force an English download when the user default is Chinese.
+
+Example:
 
 ```text
-取消
-撤回
+saved setting: zh
+image: English cover of a known translated work
+vision: English title + author
+resolver: discovers known edition titles
+source search: Chinese edition preferred, other languages remain fallback
 ```
+
+An image caption can override the current task:
+
+```text
+英文 EPUB
+```
+
+or:
+
+```text
+中文版 PDF
+```
+
+The caption override survives low-confidence/multi-book image selection.
+
+## 7. Work resolution after Telegram input
+
+Once a text/image request becomes a normal `BookRequest`, Queue processing performs:
+
+```text
+BookRequest
+  -> effective language preference
+  -> Open Library + Google Books resolver
+  -> known titles / authors / ISBNs / editions
+  -> multiple SourceAdapters
+  -> ranking + deduplication
+  -> download
+  -> R2
+  -> Gmail
+  -> Kindle
+```
+
+See [`SOURCES.md`](SOURCES.md) for resolver/source details.
 
 ## 8. Task cancellation
 
-`/cancel` cancels the most recent Telegram-linked task that is still safely cancellable.
-
-A specific task can be targeted with:
+Supported:
 
 ```text
+/cancel
+取消
+撤回
 /cancel <task-id>
 ```
 
-The task ID must belong to the same allowed Telegram user.
-
-Cancellation is accepted while the task is in:
+Safely cancellable states:
 
 ```text
 queued
@@ -201,13 +194,9 @@ downloading
 staged
 ```
 
-A successful cancellation becomes:
+A successful cancellation becomes `cancelled`.
 
-```text
-cancelled
-```
-
-Once Gmail delivery has started, the bot refuses to claim that it can recall the document. These states therefore cannot be safely cancelled:
+These states are too late to truthfully promise recall:
 
 ```text
 delivering
@@ -215,124 +204,80 @@ delivery_unknown
 delivered
 ```
 
-If cancellation wins while Queue work is already in flight, the workflow re-checks D1 before continuing. Temporary R2 data is removed best-effort and the task is not converted into a generic failure/retry.
+The Queue workflow re-checks cancellation around resolver/source search, download, R2 staging and the Gmail boundary. A cancelled task cannot be restarted by an old source-selection callback.
 
-Before image recognition has created a normal book task, `/cancel` does not cancel the AI inference job itself. Low-confidence or multi-book image recognition already presents a `取消` button on the recognition selection prompt. Once a normal book task exists, the standard `/cancel` rules apply.
+Before image recognition has created a normal book task, the inline recognition `取消` button cancels only that recognition choice; it is separate from `/cancel` for an existing task.
 
 Detailed semantics: [`CANCELLATION.md`](CANCELLATION.md).
 
-## 9. Image usage
+## 9. Workers AI
 
-Send a clear book cover, reading-app screenshot, bookstore photo, or book-list screenshot directly to the bot.
+`wrangler.toml` contains:
 
-The bot immediately acknowledges the image, then a Queue consumer performs:
-
-1. Telegram `getFile`;
-2. bounded image download;
-3. JPEG/PNG/WebP signature validation;
-4. Workers AI vision inference;
-5. title/author extraction;
-6. conversion into the normal `BookRequest` workflow.
-
-The webhook itself does not wait for vision inference.
-
-### High-confidence single book
-
-If one book is identified confidently, the bot automatically continues:
-
-```text
-识别到《Pride and Prejudice》（Jane Austen），开始查找并发送到 Kindle。
+```toml
+[ai]
+binding = "AI"
 ```
 
-### Low-confidence or multi-book image
-
-The recognition result is stored temporarily in D1 and Telegram sends inline buttons. The user selects the desired book before a book task is created.
-
-Image-choice records expire after 24 hours and are removed after selection/cancellation.
-
-### Image caption preferences
-
-A caption may contain preferences such as:
+Current vision model:
 
 ```text
-PDF
+@cf/meta/llama-3.2-11b-vision-instruct
 ```
+
+The Cloudflare account must accept the model's Meta license/AUP before first production use.
+
+Default image limit:
+
+```toml
+MAX_TELEGRAM_IMAGE_BYTES = "4194304"
+```
+
+Code also enforces a 6 MiB hard ceiling.
+
+## 10. Webhook registration
+
+Webhook URL:
 
 ```text
-英文 EPUB
+https://<worker>.workers.dev/telegram/webhook
 ```
 
-These preferences are preserved even when recognition pauses for a selection button.
+Register `message` and `callback_query`, and use the same `TELEGRAM_WEBHOOK_SECRET` as Telegram's `secret_token`.
 
-The default format remains EPUB.
+The webhook validates `X-Telegram-Bot-Api-Secret-Token`.
 
-## 10. Source-edition ambiguity
+## 11. Idempotency
 
-Image recognition ambiguity and ebook-source ambiguity are separate stages.
+`0005_telegram_update_idempotency.sql` stores processed Telegram `update_id` values.
 
-After a book title is known, the existing workflow may still reach `needs_selection` if multiple source editions are similarly ranked. Telegram then presents the normal source-candidate buttons and resumes the same task after selection.
+Settings commands, cancellation commands, normal text requests, image messages and callbacks all share this idempotency boundary so Telegram retries cannot create duplicate book tasks or duplicate vision work.
 
-## 11. Automatic notifications
+## 12. Security decisions
 
-Telegram-linked book tasks notify on:
-
-- `needs_selection`;
-- `needs_source`;
-- `staged` when delivery is unavailable;
-- `delivered`;
-- `delivery_unknown`;
-- `failed`.
-
-A successful `/cancel` replies immediately with cancellation confirmation rather than relying on Queue notification delivery.
-
-A failed Telegram notification does not turn a confirmed Kindle delivery into a failed task.
-
-## 12. Vision retry policy
-
-Vision jobs are intentionally **not automatically retried** by the Queue consumer.
-
-Reason: a retry can spend the free AI allocation again and may create duplicate recognition buttons/tasks. If vision fails, the user receives a failure message and can resend the image.
-
-Normal book tasks retain their existing retry behavior before delivery begins.
-
-## 13. Security decisions
-
-- webhook calls are authenticated with `X-Telegram-Bot-Api-Secret-Token`;
-- task/image use requires `TELEGRAM_ALLOWED_USER_IDS`;
 - only private chats are accepted;
-- image candidate callbacks are bound to the original user and chat;
-- source candidate callbacks are also bound to the original user and chat;
-- `/cancel <task-id>` verifies the task belongs to the same Telegram user;
-- Telegram file URLs are built internally and never accepted from user input;
-- image bytes are size-limited and signature-checked;
-- Bot/Gmail secrets are never stored in D1;
-- recognition results are temporary metadata only;
-- the image itself is not persisted to R2 by the vision entry layer.
+- normal use requires `TELEGRAM_ALLOWED_USER_IDS`;
+- `/whoami` can be used for bootstrap;
+- callbacks verify the original user/chat;
+- targeted cancellation verifies task ownership;
+- Telegram file URLs are built internally from Telegram `file_id`;
+- images are size-limited and signature-checked;
+- original vision images are not persisted in R2/D1;
+- Gmail/Bot credentials are never stored in D1.
 
-## 14. Local development
+## 13. Acceptance tests
 
-Add Telegram values to `.dev.vars`:
+After v0.5 deployment, test at least:
 
-```dotenv
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_WEBHOOK_SECRET=...
-TELEGRAM_ALLOWED_USER_IDS=123456789
-```
-
-Workers AI is provided by the `AI` binding. Telegram requires a public HTTPS webhook, so plain `localhost` cannot receive live Telegram updates directly. Use a secure tunnel or a temporary Cloudflare deployment for live bot testing.
-
-## 15. Acceptance tests
-
-After deployment, test at least these cases:
-
-1. one clear cover -> automatic title recognition -> normal Kindle workflow;
-2. screenshot with multiple books -> inline book-selection buttons;
-3. blurry/non-book image -> no task created;
-4. oversized image -> rejected before Workers AI;
-5. unauthorized user image -> no vision inference;
-6. image with caption `PDF` -> selected/recognized task preserves PDF preference;
-7. create a text task and immediately send `/cancel` -> task becomes `cancelled` and no Kindle delivery occurs;
-8. cancel while a task is in `needs_selection` -> later source-selection buttons cannot restart it;
-9. attempt cancellation after `delivering` -> bot reports that it is too late rather than claiming success;
-10. `/cancel <task-id>` for another user's task -> rejected;
-11. final `delivered` state -> Telegram completion message.
+1. `/settings` on a user with no row -> `中文优先`, `EPUB`;
+2. `/language en` -> `/settings` reports English preferred;
+3. `/language zh` -> restores Chinese preferred;
+4. saved `zh` + `Pride and Prejudice 英文` -> current task English preference only;
+5. next request without a language -> Chinese preference restored;
+6. saved `zh` + English cover image -> resolver still prefers known Chinese edition titles;
+7. clear cover -> normal vision path;
+8. multi-book screenshot -> image selection buttons;
+9. `/cancel` during a cancellable task -> no Gmail delivery;
+10. stale source-selection button after cancellation -> cannot revive the task;
+11. repeated Telegram update -> no duplicate task/inference;
+12. final normal task -> delivered notification and Kindle confirmation.
