@@ -1,6 +1,6 @@
 # Deployment
 
-This project intentionally supports two execution modes from the same codebase.
+This project supports local and Cloudflare execution from the same codebase.
 
 ## A. Local mode
 
@@ -11,7 +11,7 @@ Use local mode for development, testing, or running the workflow on a machine/NA
 - Node.js 20+
 - npm
 
-### Steps
+### 1. Install
 
 ```bash
 git clone https://github.com/Felix8686/book-to-kindle.git
@@ -19,20 +19,28 @@ cd book-to-kindle
 npm install
 ```
 
+### 2. Configure local secrets
+
 Create `.dev.vars`:
 
 ```dotenv
 API_TOKEN=replace-with-a-long-random-secret
 KINDLE_EMAIL=your-kindle-address@kindle.com
+GMAIL_CLIENT_ID=...
+GMAIL_CLIENT_SECRET=...
+GMAIL_REFRESH_TOKEN=...
+GMAIL_FROM_EMAIL=your-gmail-address@gmail.com
 ```
 
-Apply the local D1 migration:
+See [`GMAIL_OAUTH.md`](GMAIL_OAUTH.md) for OAuth setup.
+
+### 3. Apply D1 migrations
 
 ```bash
 npm run db:migrate:local
 ```
 
-Start the local Worker:
+### 4. Start
 
 ```bash
 npm run dev
@@ -44,22 +52,36 @@ Health check:
 curl http://localhost:8787/health
 ```
 
-Create a test task:
+### 5. Create a public-domain test task
 
 ```bash
 curl -X POST http://localhost:8787/api/v1/tasks \
   -H "Authorization: Bearer replace-with-a-long-random-secret" \
   -H "Content-Type: application/json" \
-  -d '{"query":"The Little Prince","language":"en","preferredFormat":"epub"}'
+  -d '{"query":"Pride and Prejudice","author":"Jane Austen","language":"en","preferredFormat":"epub"}'
 ```
 
-The initial v0.1 skeleton has no production source adapter yet, so a queued task will settle in `needs_source`. That is expected until v0.2+ adapters are enabled.
+Poll the returned ID:
+
+```bash
+curl http://localhost:8787/api/v1/tasks/<TASK_ID> \
+  -H "Authorization: Bearer replace-with-a-long-random-secret"
+```
+
+If the task becomes `needs_selection`, choose one returned candidate:
+
+```bash
+curl -X POST http://localhost:8787/api/v1/tasks/<TASK_ID>/select \
+  -H "Authorization: Bearer replace-with-a-long-random-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"candidateId":"gutenberg:1342:epub"}'
+```
 
 ---
 
 ## B. Cloudflare mode
 
-Cloudflare is the always-on deployment target. It does not require a VPS.
+Cloudflare is the always-on deployment target. A VPS is not required.
 
 ### 1. Authenticate Wrangler
 
@@ -75,7 +97,7 @@ npx wrangler d1 create book-to-kindle
 
 Copy the returned database ID into `wrangler.toml`.
 
-### 3. Create R2 bucket
+### 3. Create R2
 
 ```bash
 npx wrangler r2 bucket create book-to-kindle-files
@@ -93,15 +115,21 @@ npx wrangler queues create book-to-kindle-dlq
 ```bash
 npx wrangler secret put API_TOKEN
 npx wrangler secret put KINDLE_EMAIL
+npx wrangler secret put GMAIL_CLIENT_ID
+npx wrangler secret put GMAIL_CLIENT_SECRET
+npx wrangler secret put GMAIL_REFRESH_TOKEN
+npx wrangler secret put GMAIL_FROM_EMAIL
 ```
 
-Future Gmail delivery will add OAuth secrets. Do not place them in `wrangler.toml`.
+Never place OAuth credentials in `wrangler.toml` or commit them to Git.
 
-### 6. Apply migration
+### 6. Apply migrations
 
 ```bash
 npm run db:migrate:remote
 ```
+
+This applies both the initial task schema and the candidate-list migration.
 
 ### 7. Deploy
 
@@ -115,38 +143,66 @@ npm run deploy
 curl https://<your-worker>.workers.dev/health
 ```
 
-Then submit a task with the same API used in local mode.
+A fully configured deployment should report Gmail delivery as configured.
+
+### 9. Run an end-to-end test
+
+Submit the same `Pride and Prejudice` request used in local mode, then poll its task ID until it reaches `delivered`, `needs_selection`, `needs_source`, or `failed`.
 
 ---
 
-## C. Optional local enhancement node
+## C. Cloud-path resource guardrails
 
-The future enhancement node is deliberately separate from the Worker runtime.
+The default Worker configuration uses:
+
+```toml
+MAX_CLOUD_FILE_BYTES = "20971520"
+```
+
+This is 20 MiB. It intentionally leaves room below Gmail's normal personal-account attachment ceiling.
+
+The source adapter also:
+
+- limits streamed downloads to this size;
+- restricts download hosts to `gutenberg.org`;
+- validates EPUB/PDF signatures before R2 staging.
+
+If a future source supplies a file that needs native repair/conversion or is too large for this path, the workflow should delegate it to the optional local enhancement node instead of forcing Cloudflare to process it.
+
+---
+
+## D. Optional local enhancement node
+
+The enhancement node remains deliberately separate from the Worker runtime.
 
 Expected responsibilities:
 
 - Shelfmark integration;
 - Calibre/CWA repair and conversion;
-- processing files too large or expensive for the Cloudflare path.
+- processing files too large or expensive for the Cloudflare path;
+- handling formats that need native conversion before Send to Kindle.
 
-The enhancement node should expose a narrow HTTP/pull-consumer contract. The core workflow should continue to function when the node is offline.
+The core workflow must continue to function while this node is offline.
 
-This gives the desired behavior:
+Desired behavior:
 
-- PC on: Cloudflare may delegate difficult tasks to the local node.
-- PC off: Cloudflare still handles lightweight compatible files independently.
+- PC/NAS online: difficult tasks can be delegated locally.
+- PC/NAS offline: Cloudflare still handles compatible lightweight EPUB/PDF files independently.
 
 ---
 
-## D. Production checklist
+## E. Production checklist
 
 Before exposing the service publicly:
 
 - [ ] Replace the placeholder D1 database ID.
 - [ ] Configure a strong `API_TOKEN`.
-- [ ] Add production source adapters with domain allowlists.
-- [ ] Add file-signature/content-type validation.
-- [ ] Add Gmail OAuth delivery.
-- [ ] Add Telegram webhook secret verification before enabling Telegram.
-- [ ] Configure R2 lifecycle deletion as a second safety net for stale temporary files.
-- [ ] Add structured error/attempt fields and dead-letter handling UI or commands.
+- [ ] Apply all D1 migrations.
+- [ ] Configure Gmail OAuth secrets.
+- [ ] Confirm the Gmail sender is permitted by Amazon Send to Kindle settings.
+- [ ] Verify the correct Kindle Send-to-Kindle email address.
+- [ ] Run at least one successful public-domain EPUB delivery.
+- [ ] Verify `needs_selection` can be resolved through the selection API.
+- [ ] Configure an R2 lifecycle rule as a second safety net for stale temporary objects.
+- [ ] Keep Telegram disabled until webhook secret verification is implemented.
+- [ ] Review queue/dead-letter failures before adding automatic retry controls for delivery.
