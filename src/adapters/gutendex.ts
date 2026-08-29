@@ -1,4 +1,4 @@
-import type { BookCandidate, BookRequest, SourceAdapter } from "../domain";
+import type { BookCandidate, BookSearchContext, SourceAdapter } from "../domain";
 
 interface GutendexBook {
   id: number;
@@ -19,30 +19,11 @@ interface SourceRef {
   bookId: number;
 }
 
-function normalizeLanguage(language?: string): string | undefined {
-  if (!language) return undefined;
-  const value = language.trim().toLowerCase();
-  const aliases: Record<string, string> = {
-    english: "en",
-    chinese: "zh",
-    japanese: "ja",
-    french: "fr",
-    german: "de",
-    spanish: "es",
-    italian: "it",
-    portuguese: "pt",
-    russian: "ru",
-  };
-  return aliases[value] ?? value.slice(0, 2);
-}
-
 function formatsFor(book: GutendexBook): Array<{ format: "epub" | "pdf"; contentType: string; url: string }> {
   const output: Array<{ format: "epub" | "pdf"; contentType: string; url: string }> = [];
 
   const epub = book.formats["application/epub+zip"];
   if (epub) {
-    // Gutendex commonly returns the image-heavy EPUB3 variant. Prefer Gutenberg's
-    // standard no-images EPUB so valid public-domain books stay within the cloud limit.
     output.push({
       format: "epub",
       contentType: "application/epub+zip",
@@ -87,49 +68,59 @@ function limitedStream(
   );
 }
 
+async function searchVariant(query: string): Promise<GutendexBook[]> {
+  const url = new URL("https://gutendex.com/books");
+  url.searchParams.set("search", query);
+  url.searchParams.set("copyright", "false");
+
+  const response = await fetch(url.toString(), {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) throw new Error(`Gutendex search failed with HTTP ${response.status}.`);
+  return ((await response.json()) as GutendexResponse).results ?? [];
+}
+
 export class GutendexSource implements SourceAdapter {
   readonly name = "gutendex";
 
-  async search(request: BookRequest): Promise<BookCandidate[]> {
-    const query = [request.query, request.author].filter(Boolean).join(" ");
-    const url = new URL("https://gutendex.com/books");
-    url.searchParams.set("search", query);
-    url.searchParams.set("copyright", "false");
-
-    const language = normalizeLanguage(request.language);
-    if (language) url.searchParams.set("languages", language);
-
-    const response = await fetch(url.toString(), {
-      headers: { accept: "application/json" },
-    });
-    if (!response.ok) {
-      throw new Error(`Gutendex search failed with HTTP ${response.status}.`);
-    }
-
-    const data = (await response.json()) as GutendexResponse;
+  async search(context: BookSearchContext): Promise<BookCandidate[]> {
+    const queries = context.queryVariants
+      .slice(0, 3)
+      .map((title) => [title, context.request.author].filter(Boolean).join(" "));
+    const settled = await Promise.allSettled(queries.map((query) => searchVariant(query)));
+    const seen = new Set<string>();
     const candidates: BookCandidate[] = [];
 
-    for (const book of data.results.slice(0, 12)) {
-      if (book.copyright !== false) continue;
-      const author = book.authors.map((item) => item.name).filter(Boolean).join(", ") || undefined;
+    for (const result of settled) {
+      if (result.status !== "fulfilled") continue;
+      for (const book of result.value.slice(0, 12)) {
+        if (book.copyright !== false) continue;
+        const author = book.authors.map((item) => item.name).filter(Boolean).join(", ") || undefined;
 
-      for (const item of formatsFor(book)) {
-        if (!isAllowedDownloadUrl(item.url)) continue;
-        const sourceRef: SourceRef = {
-          url: item.url,
-          contentType: item.contentType,
-          bookId: book.id,
-        };
+        for (const item of formatsFor(book)) {
+          if (!isAllowedDownloadUrl(item.url)) continue;
+          const id = `gutenberg:${book.id}:${item.format}`;
+          if (seen.has(id)) continue;
+          seen.add(id);
+          const sourceRef: SourceRef = {
+            url: item.url,
+            contentType: item.contentType,
+            bookId: book.id,
+          };
 
-        candidates.push({
-          id: `gutenberg:${book.id}:${item.format}`,
-          title: book.title,
-          author,
-          language: book.languages[0],
-          format: item.format,
-          source: this.name,
-          sourceRef: JSON.stringify(sourceRef),
-        });
+          candidates.push({
+            id,
+            title: book.title,
+            author,
+            language: book.languages[0],
+            format: item.format,
+            source: this.name,
+            sourceRef: JSON.stringify(sourceRef),
+            sourceQuality: 30,
+            editionKey: `gutenberg:${book.id}`,
+          });
+        }
       }
     }
 
