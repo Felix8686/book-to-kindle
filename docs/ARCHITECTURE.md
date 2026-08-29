@@ -21,6 +21,7 @@ The project must not require a VPS.
 6. A low-confidence search result must require selection rather than silently sending the first match.
 7. Providers and delivery mechanisms must be adapters so they can be replaced without rewriting orchestration.
 8. Bundled source adapters must target public-domain, user-owned, or otherwise authorized content.
+9. Delivery retries must prefer avoiding duplicates over blind automatic resend.
 
 ## 3. Runtime topology
 
@@ -66,7 +67,7 @@ Queue jobs can:
 - download a compatible file;
 - validate and stage it in R2;
 - invoke delivery;
-- retry upstream failures.
+- retry failures that happen before delivery begins.
 
 The queue message contains only a task ID. It never contains ebook bytes.
 
@@ -94,13 +95,22 @@ needs_source      needs_selection
                        |
                        v
                    delivering
-                       |
-             +---------+---------+
-             v                   v
-         delivered             failed
+                    /      \
+                   v        v
+             delivered   delivery_unknown
+                              |
+                              | explicit human check/retry later
+                              v
+                           (future)
+
+Failures before delivery begins -> failed -> Queue may retry.
 ```
 
-`needs_source` and `needs_selection` are intentional non-error states. Candidate lists are persisted in D1 so a chat client can ask the user which edition to use and resume the same task afterwards.
+`needs_source`, `needs_selection`, and `delivery_unknown` are intentional states rather than generic errors.
+
+- Candidate lists are persisted in D1 so a chat client can ask which edition to use and resume the same task.
+- `delivery_unknown` means Gmail delivery had started but the final result could not be confirmed. Automatic resend is blocked because the document may already be in Gmail/Kindle.
+- Successful Gmail responses produce a persisted delivery receipt when Gmail returns message metadata.
 
 ## 6. Candidate ranking
 
@@ -126,7 +136,7 @@ Safety and scope rules:
 - return only EPUB/PDF candidates;
 - restrict actual downloads to HTTPS hosts under `gutenberg.org`;
 - stream downloads through a byte limit;
-- validate EPUB ZIP or PDF signatures before R2 staging.
+- validate EPUB ZIP or PDF signatures before R2 staging, including when signature bytes are split across stream chunks.
 
 This adapter is intentionally useful for end-to-end testing without making an unauthorized-content provider part of the default project.
 
@@ -140,11 +150,14 @@ It uses:
 - `gmail.send` scope;
 - Gmail `users.messages.send` media-upload URI;
 - RFC 822 multipart MIME;
-- streaming from R2 into the outbound message.
+- streaming from R2 into the outbound message;
+- a delivery receipt containing provider, accepted timestamp, and Gmail message/thread IDs when returned.
 
 The default cloud file threshold is **20 MiB**, capped in code below 24 MiB. This is an engineering guardrail, not an Amazon maximum.
 
-To reduce duplicate documents, a task found in `delivering` after an unknown previous outcome is not automatically resent. It is moved to `failed` for explicit inspection.
+After status becomes `delivering`, any unconfirmed outcome is treated conservatively. The task becomes `delivery_unknown` and is not automatically resent.
+
+R2 deletion occurs only after confirmed Gmail success and is best-effort: cleanup failure cannot change a successful delivery into a failed task.
 
 ## 9. Cloudflare resource model
 
@@ -153,7 +166,7 @@ Design target as of 2026-08-29:
 - HTTP Worker path: very small CPU use; validate, persist, enqueue.
 - Queue consumer: network-heavy search/download/delivery work.
 - R2: temporary ebook staging and streaming source for delivery.
-- D1: task metadata and candidate lists only.
+- D1: task metadata, candidate lists, and delivery receipts only.
 
 The workflow avoids full-file buffering in JavaScript memory on the cloud path.
 
@@ -206,7 +219,7 @@ interface SourceAdapter {
 ```ts
 interface DeliveryAdapter {
   name: string;
-  deliver(input: DeliveryInput): Promise<void>;
+  deliver(input: DeliveryInput): Promise<DeliveryReceipt>;
 }
 ```
 
