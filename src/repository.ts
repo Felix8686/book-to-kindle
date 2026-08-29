@@ -1,4 +1,10 @@
-import type { BookCandidate, BookRequest, TaskRecord, TaskStatus } from "./domain";
+import type {
+  BookCandidate,
+  BookRequest,
+  DeliveryReceipt,
+  TaskRecord,
+  TaskStatus,
+} from "./domain";
 
 function parseJson<T>(value: unknown): T | undefined {
   if (typeof value !== "string" || !value) return undefined;
@@ -31,7 +37,7 @@ export class TaskRepository {
     const row = await this.db
       .prepare(
         `SELECT id, status, request_json, candidates_json, selected_candidate_json, storage_key,
-                error_message, created_at, updated_at
+                delivery_receipt_json, error_message, created_at, updated_at
          FROM tasks WHERE id = ?1`,
       )
       .bind(id)
@@ -46,6 +52,7 @@ export class TaskRepository {
       candidates: parseJson<BookCandidate[]>(row.candidates_json),
       selectedCandidate: parseJson<BookCandidate>(row.selected_candidate_json),
       storageKey: row.storage_key ? String(row.storage_key) : undefined,
+      deliveryReceipt: parseJson<DeliveryReceipt>(row.delivery_receipt_json),
       errorMessage: row.error_message ? String(row.error_message) : undefined,
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
@@ -59,6 +66,7 @@ export class TaskRepository {
       candidates?: BookCandidate[] | null;
       selectedCandidate?: BookCandidate | null;
       storageKey?: string | null;
+      deliveryReceipt?: DeliveryReceipt | null;
       errorMessage?: string | null;
     },
   ): Promise<void> {
@@ -74,6 +82,10 @@ export class TaskRepository {
         : patch.selectedCandidate ?? undefined;
     const storageKey =
       patch.storageKey === undefined ? current.storageKey : patch.storageKey ?? undefined;
+    const deliveryReceipt =
+      patch.deliveryReceipt === undefined
+        ? current.deliveryReceipt
+        : patch.deliveryReceipt ?? undefined;
     const errorMessage =
       patch.errorMessage === undefined ? current.errorMessage : patch.errorMessage ?? undefined;
 
@@ -84,8 +96,9 @@ export class TaskRepository {
              candidates_json = ?3,
              selected_candidate_json = ?4,
              storage_key = ?5,
-             error_message = ?6,
-             updated_at = ?7
+             delivery_receipt_json = ?6,
+             error_message = ?7,
+             updated_at = ?8
          WHERE id = ?1`,
       )
       .bind(
@@ -94,6 +107,7 @@ export class TaskRepository {
         candidates ? JSON.stringify(candidates) : null,
         candidate ? JSON.stringify(candidate) : null,
         storageKey ?? null,
+        deliveryReceipt ? JSON.stringify(deliveryReceipt) : null,
         errorMessage ?? null,
         new Date().toISOString(),
       )
