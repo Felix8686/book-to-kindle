@@ -11,7 +11,43 @@ The project follows Semantic Versioning while it is practical to do so.
 - browser/share-sheet entry point
 - optional Shelfmark/CWA/Calibre enhancement node
 - explicit user-controlled retry for uncertain deliveries
-- additional authorized/public-domain source adapters
+- optional Amazon catalog resolver using supported API credentials
+- additional verified public/open-access source adapters
+
+## [0.5.0] - 2026-08-29
+
+### Added
+- persistent Telegram user settings in D1 via `0007_user_settings.sql`
+- system default book language set to Chinese preferred (`zh`)
+- `/settings`, `/language zh`, `/language en`, `/语言 中文`, and `/语言 英文`
+- one-request language override without changing the saved default
+- language preference applied to both text and image-originated book tasks
+- Open Library work/edition resolver
+- Google Books metadata resolver
+- cross-language edition-title discovery without blind machine translation
+- canonical work identity containing titles, authors, ISBNs, Open Library work keys and Google volume IDs
+- Google Books Free download adapter
+- Internet Archive public-access download adapter
+- multi-source candidate normalization, scoring and cross-provider deduplication
+- resolver/source inventory in `/health`
+- dedicated `docs/SOURCES.md`
+
+### Changed
+- source search now receives a resolved `BookSearchContext` rather than only the raw user string
+- Gutendex searches multiple resolved title variants instead of a single literal title
+- language is a ranking preference rather than a hard filter, allowing fallback when a preferred-language file is unavailable
+- source failures use isolated `Promise.allSettled` behavior so one provider cannot stop the whole search
+- source order no longer determines the winner; candidate scoring combines identity, ISBN, author, language, format and source quality
+- duplicate editions returned by multiple sources are collapsed before Telegram selection
+- version bumped to `0.5.0`
+
+### Source policy
+- `gutendex` remains restricted to Project Gutenberg public-domain records
+- `google-books-free` only emits full/free volumes with actual EPUB/PDF download links
+- `internet-archive-public` only emits Open Library records marked `ebook_access=public`, then rejects restricted/private Archive files
+- Standard Ebooks is documented but not enabled by default because its searchable OPDS catalog currently requires membership/project access
+- OAPEN is documented as a future adapter pending a stable verified machine API contract
+- Amazon remains an optional metadata enhancement and is not scraped or required
 
 ## [0.4.0] - 2026-08-29
 
