@@ -59,7 +59,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
   if (url.pathname === "/telegram/webhook") {
-    const controlResponse = await handleTelegramControlWebhook(request.clone(), env);
+    const controlResponse = await handleTelegramControlWebhook(
+      request.clone() as unknown as Request,
+      env,
+    );
     if (controlResponse) return controlResponse;
     return handleTelegramWebhook(request, env);
   }
