@@ -4,7 +4,7 @@ This project supports local and Cloudflare execution from the same codebase.
 
 ## A. Local mode
 
-Use local mode for development, testing, or running the workflow on a machine/NAS without deploying to Cloudflare.
+Use local mode for development, testing, or running the core workflow on a machine/NAS without deploying to Cloudflare.
 
 ### Requirements
 
@@ -30,9 +30,12 @@ GMAIL_CLIENT_ID=...
 GMAIL_CLIENT_SECRET=...
 GMAIL_REFRESH_TOKEN=...
 GMAIL_FROM_EMAIL=your-gmail-address@gmail.com
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_WEBHOOK_SECRET=...
+TELEGRAM_ALLOWED_USER_IDS=123456789
 ```
 
-See [`GMAIL_OAUTH.md`](GMAIL_OAUTH.md) for OAuth setup.
+See [`GMAIL_OAUTH.md`](GMAIL_OAUTH.md) for Gmail OAuth and [`TELEGRAM.md`](TELEGRAM.md) for Telegram setup.
 
 ### 3. Apply D1 migrations
 
@@ -40,7 +43,7 @@ See [`GMAIL_OAUTH.md`](GMAIL_OAUTH.md) for OAuth setup.
 npm run db:migrate:local
 ```
 
-This applies the task schema, candidate persistence, and delivery-receipt migration.
+This applies the task schema, candidate persistence, delivery receipts, and Telegram task mapping.
 
 ### 4. Start
 
@@ -81,7 +84,16 @@ curl -X POST http://localhost:8787/api/v1/tasks/<TASK_ID>/select \
 
 A successful task reaches `delivered` and may include a Gmail `deliveryReceipt` with message/thread IDs.
 
-If a task reaches `delivery_unknown`, do not blindly resend it. Check Gmail Sent and the Kindle library first; the state deliberately blocks automatic resend because the previous delivery may already have succeeded.
+If a task reaches `delivery_unknown`, do not blindly resend it. Check Gmail Sent and the Kindle library first.
+
+### Local Telegram note
+
+Telegram requires a public HTTPS webhook URL. A plain local Wrangler URL such as `http://localhost:8787` cannot be registered directly with Telegram.
+
+Use either:
+
+- a secure HTTPS tunnel for local Telegram testing; or
+- the normal deployed Cloudflare Worker for Telegram while testing the rest locally.
 
 ---
 
@@ -116,7 +128,7 @@ npx wrangler queues create book-to-kindle-tasks
 npx wrangler queues create book-to-kindle-dlq
 ```
 
-### 5. Configure secrets
+### 5. Configure core/Gmail secrets
 
 ```bash
 npx wrangler secret put API_TOKEN
@@ -127,33 +139,104 @@ npx wrangler secret put GMAIL_REFRESH_TOKEN
 npx wrangler secret put GMAIL_FROM_EMAIL
 ```
 
-Never place OAuth credentials in `wrangler.toml` or commit them to Git.
+Never place credentials in `wrangler.toml` or commit them to Git.
 
-### 6. Apply migrations
+### 6. Configure Telegram bootstrap secrets
+
+Create a Telegram bot through `@BotFather`, then configure:
+
+```bash
+npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
+```
+
+Do not configure `TELEGRAM_ALLOWED_USER_IDS` until you have used `/whoami`, unless you already know your numeric Telegram user ID.
+
+See [`TELEGRAM.md`](TELEGRAM.md) for the exact setup flow.
+
+### 7. Apply all migrations
 
 ```bash
 npm run db:migrate:remote
 ```
 
-This applies all current migrations, including candidate lists and Gmail delivery receipts.
+Current migrations:
 
-### 7. Deploy
+```text
+0001_init.sql
+0002_candidates.sql
+0003_delivery_receipt.sql
+0004_telegram_entry.sql
+```
+
+### 8. Deploy
 
 ```bash
 npm run deploy
 ```
 
-### 8. Verify
+### 9. Verify health
 
 ```bash
 curl https://<your-worker>.workers.dev/health
 ```
 
-A fully configured deployment should report Gmail delivery as configured.
+A configured deployment should report Gmail delivery and Telegram as configured.
 
-### 9. Run an end-to-end test
+### 10. Register the Telegram webhook
 
-Submit the same `Pride and Prejudice` request used in local mode, then poll its task ID until it reaches `delivered`, `delivery_unknown`, `needs_selection`, `needs_source`, or `failed`.
+Register:
+
+```text
+https://<your-worker>.workers.dev/telegram/webhook
+```
+
+Use the same value stored as `TELEGRAM_WEBHOOK_SECRET` as Telegram's `secret_token` and restrict updates to:
+
+```text
+message
+callback_query
+```
+
+Full commands: [`TELEGRAM.md`](TELEGRAM.md).
+
+### 11. Discover and authorize the Telegram user
+
+Send the bot:
+
+```text
+/whoami
+```
+
+Then save the returned numeric user ID:
+
+```bash
+npx wrangler secret put TELEGRAM_ALLOWED_USER_IDS
+```
+
+For multiple allowed users, store a comma-separated list.
+
+If this secret is absent or empty, Telegram task creation remains denied by default.
+
+### 12. Run an end-to-end Telegram test
+
+Send the bot:
+
+```text
+把《Pride and Prejudice》发到 Kindle
+```
+
+Expected flow:
+
+```text
+Telegram acknowledgement
+-> Queue processing
+-> optional inline candidate selection
+-> Gmail delivery
+-> Telegram "已发送到 Kindle" notification
+```
+
+The user should not need the HTTP API for normal operation.
 
 ---
 
@@ -175,6 +258,8 @@ The source adapter also:
 - validates EPUB/PDF signatures before R2 staging, even if the signature arrives across multiple stream chunks.
 
 R2 staging supplies the known content length through `FixedLengthStream` when the source provides one; otherwise it uses a bounded buffer that remains within the same cloud-size guardrail.
+
+Telegram messages only create lightweight D1 records and Queue messages; book bytes never pass through Telegram or D1.
 
 If a future source supplies a file that needs native repair/conversion or is too large for this path, the workflow should delegate it to the optional local enhancement node instead of forcing Cloudflare to process it.
 
@@ -202,18 +287,23 @@ Desired behavior:
 
 ## E. Production checklist
 
-Before exposing the service publicly:
+Before treating the deployment as complete:
 
 - [ ] Replace the placeholder D1 database ID.
 - [ ] Configure a strong `API_TOKEN`.
-- [ ] Apply all D1 migrations (`0001` through `0003`).
+- [ ] Apply all D1 migrations (`0001` through `0004`).
 - [ ] Configure Gmail OAuth secrets.
 - [ ] Confirm the Gmail sender is permitted by Amazon Send to Kindle settings.
 - [ ] Verify the correct Kindle Send-to-Kindle email address.
 - [ ] Run at least one successful public-domain EPUB delivery.
-- [ ] Verify the response contains a delivery receipt when Gmail returns message metadata.
-- [ ] Verify `needs_selection` can be resolved through the selection API.
 - [ ] Verify `delivery_unknown` never causes an automatic resend.
+- [ ] Configure `TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET`.
+- [ ] Register `/telegram/webhook` with Telegram using `secret_token`.
+- [ ] Verify `/whoami` works before Telegram allowlist setup.
+- [ ] Configure `TELEGRAM_ALLOWED_USER_IDS`.
+- [ ] Verify unauthorized Telegram users cannot create tasks.
+- [ ] Verify group chats are rejected.
+- [ ] Verify `needs_selection` produces inline buttons and resumes the same task after selection.
+- [ ] Verify Telegram receives the final `delivered` notification.
 - [ ] Configure an R2 lifecycle rule as a second safety net for stale temporary objects.
-- [ ] Keep Telegram disabled until webhook secret verification is implemented.
 - [ ] Review queue/dead-letter failures before adding explicit retry controls for uncertain delivery.
