@@ -6,17 +6,43 @@ The project follows Semantic Versioning while it is practical to do so.
 
 ## [Unreleased]
 
-### Fixed
-- prefer the smaller standard no-images Project Gutenberg EPUB variant so compatible public-domain books are not rejected after downloading an oversized image edition
-- provide R2 with a known content length when staging streamed downloads
-
 ### Planned
-- Telegram webhook entry point
 - Hermes Skill/MCP bridge
 - browser/share-sheet entry point
 - optional Shelfmark/CWA/Calibre enhancement node
 - explicit user-controlled retry for uncertain deliveries
 - additional authorized/public-domain source adapters
+
+## [0.3.0] - 2026-08-29
+
+### Added
+- Telegram Bot webhook entrypoint at `/telegram/webhook`
+- webhook verification through Telegram `secret_token` / `X-Telegram-Bot-Api-Secret-Token`
+- Telegram user allowlist via `TELEGRAM_ALLOWED_USER_IDS`
+- `/whoami`, `/help`, `/send` and `/status` commands
+- direct-title and lightweight natural-language book request parsing
+- EPUB default preference with explicit PDF selection support
+- private-chat-only Telegram operation
+- D1 `telegram_task_links` mapping between core tasks and Telegram requester/chat
+- inline Telegram buttons for resolving `needs_selection`
+- automatic Telegram notifications for selection, no-source, staged, delivered, uncertain-delivery and failed states
+- duplicate notification suppression using `last_notified_status`
+- Telegram configuration status in `/health`
+- dedicated Telegram deployment/setup documentation
+
+### Security / architecture
+- Telegram is implemented as an adapter around the existing task API/state machine rather than being embedded in the core book model
+- task creation is denied until an explicit Telegram user allowlist is configured
+- `/whoami` remains available before allowlist setup to safely bootstrap the authorized user ID
+- candidate callback actions are bound to the original Telegram user and chat
+- Telegram webhook traffic uses its own secret header and does not expose or reuse the normal API bearer token
+- the direct Telegram -> Cloudflare path works independently of Hermes or a powered-on PC
+
+## [0.2.2] - 2026-08-29
+
+### Fixed
+- prefer the smaller standard no-images Project Gutenberg EPUB variant so compatible public-domain books are not rejected after downloading an oversized image edition
+- provide R2 with a known content length when staging streamed downloads
 
 ## [0.2.1] - 2026-08-29
 
