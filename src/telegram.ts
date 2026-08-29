@@ -278,6 +278,23 @@ class TelegramImageChoiceRepository {
   }
 }
 
+class TelegramUpdateRepository {
+  constructor(private readonly db: D1Database) {}
+
+  async claim(updateId: number): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `INSERT INTO telegram_updates (update_id, received_at)
+         VALUES (?1, ?2)
+         ON CONFLICT(update_id) DO NOTHING`,
+      )
+      .bind(updateId, new Date().toISOString())
+      .run();
+
+    return Number(result.meta.changes ?? 0) > 0;
+  }
+}
+
 function telegramApiUrl(env: Env, method: string): string {
   if (!env.TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
   return `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
@@ -1100,7 +1117,14 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
     return new Response("invalid_json", { status: 400 });
   }
 
+  if (!Number.isInteger(update.update_id) || update.update_id < 0) {
+    return new Response("invalid_update", { status: 400 });
+  }
+
   try {
+    const updates = new TelegramUpdateRepository(env.DB);
+    if (!(await updates.claim(update.update_id))) return new Response("ok");
+
     if (update.message) await handleMessage(env, update.message);
     else if (update.callback_query) await handleCallbackQuery(env, update.callback_query);
   } catch (error) {
