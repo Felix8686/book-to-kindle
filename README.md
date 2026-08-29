@@ -49,7 +49,7 @@ Cloudflare is the always-on control plane, not a VPS replacement. Heavy ebook re
 
 ## Current status
 
-**v0.2.0 — first end-to-end cloud delivery path**
+**v0.2.1 — first end-to-end cloud path with conservative delivery idempotency**
 
 Implemented:
 
@@ -62,11 +62,13 @@ Implemented:
 - manual candidate-selection endpoint
 - built-in Gutendex / Project Gutenberg public-domain source adapter
 - Project Gutenberg download-domain allowlist
-- EPUB/PDF signature validation before staging
 - streaming file-size guardrail
+- EPUB/PDF signature validation across stream chunks
 - Gmail OAuth refresh-token flow
 - Gmail `message/rfc822` media-upload delivery
-- duplicate-send guard when a previous delivery outcome is unknown
+- persisted Gmail delivery receipt (`messageId`, `threadId`, accepted timestamp)
+- `delivery_unknown` safety state when Gmail outcome cannot be confirmed
+- duplicate-send protection for uncertain deliveries
 - local execution through Wrangler
 - GitHub Actions TypeScript validation
 
@@ -76,7 +78,7 @@ Still planned:
 - Hermes Skill/MCP adapter
 - browser/share-sheet entry point
 - optional Shelfmark/CWA/Calibre local enhancement node
-- richer delivery receipts/retry controls
+- explicit user-controlled retry for uncertain deliveries
 - additional authorized/public-domain source adapters
 
 ## API
@@ -112,12 +114,13 @@ GET /api/v1/tasks/<id>
 Authorization: Bearer <API_TOKEN>
 ```
 
-Typical terminal states:
+Important states:
 
-- `delivered` — sent successfully
+- `delivered` — Gmail accepted the message; a delivery receipt is stored when available
+- `delivery_unknown` — Gmail delivery started but the final outcome could not be confirmed; automatic resend is blocked
 - `needs_selection` — several plausible editions were found
 - `needs_source` — no compatible public-domain source was found
-- `failed` — processing or delivery failed
+- `failed` — processing failed before delivery was known to have started
 
 ### Resolve an ambiguous match
 
@@ -167,14 +170,14 @@ GMAIL_REFRESH_TOKEN=...
 GMAIL_FROM_EMAIL=your-gmail-address@gmail.com
 ```
 
-See [`docs/GMAIL_OAUTH.md`](docs/GMAIL_OAUTH.md) for the Gmail setup.
+See [`docs/GMAIL_OAUTH.md`](docs/GMAIL_OAUTH.md) for Gmail setup.
 
 ## Cloudflare deployment
 
 1. Create a D1 database, R2 bucket, task queue and dead-letter queue.
 2. Replace the D1 placeholder ID in `wrangler.toml`.
-3. Store all credentials with Wrangler secrets.
-4. Apply migrations.
+3. Store credentials with Wrangler secrets.
+4. Apply all migrations.
 5. Deploy.
 
 ```bash
@@ -193,7 +196,7 @@ Detailed steps are in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 4. Avoid Docker/Calibre/native binaries in the Cloudflare core path.
 5. Stream downloads and delivery rather than buffering entire books in memory.
 6. Reject files above the configured cloud-path threshold.
-7. Delete temporary R2 objects after confirmed delivery.
+7. Delete temporary R2 objects after confirmed delivery; cleanup failure must not change a successful delivery into a failed task.
 
 The default cloud-path threshold is currently **20 MiB**. Gmail personal accounts have a 25 MB attachment ceiling, so the project leaves headroom instead of targeting that limit directly.
 
@@ -204,8 +207,8 @@ The first bundled provider is **Gutendex**, an API over Project Gutenberg metada
 - requests only entries marked `copyright=false` by Gutendex;
 - supports title/author search and language filtering;
 - exposes EPUB/PDF candidates;
-- only follows downloads hosted under `gutenberg.org`;
-- validates basic EPUB/PDF file signatures before R2 staging.
+- only follows HTTPS downloads hosted under `gutenberg.org`;
+- validates EPUB/PDF file signatures before R2 staging.
 
 Copyright status varies by jurisdiction. Users remain responsible for ensuring they are allowed to obtain and use a specific file.
 
@@ -225,6 +228,8 @@ GMAIL_FROM_EMAIL
 
 The Gmail sender must also be allowed by the user's Amazon Send to Kindle settings.
 
+A confirmed Gmail response is stored as `deliveryReceipt`. If delivery starts but the outcome is uncertain, the task becomes `delivery_unknown` and is not automatically resent.
+
 ## Repository layout
 
 ```text
@@ -239,6 +244,7 @@ src/
 migrations/
   0001_init.sql
   0002_candidates.sql
+  0003_delivery_receipt.sql
 docs/
   ARCHITECTURE.md
   DEPLOYMENT.md
@@ -260,6 +266,7 @@ CHANGELOG.md
 - candidate confirmation endpoint
 - Gmail OAuth delivery
 - streaming upload and file validation
+- delivery receipts and duplicate-send protection
 
 ### v0.3 — AI entry points
 - Telegram webhook
