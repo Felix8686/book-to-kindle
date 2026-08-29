@@ -215,7 +215,7 @@ async function validatedBookStream(
 
 async function isCancelled(repo: TaskRepository, taskId: string): Promise<boolean> {
   const latest = await repo.get(taskId);
-  return Boolean(latest && latest.status === "cancelled");
+  return Boolean(latest && String(latest.status) === "cancelled");
 }
 
 async function cleanupCancelledObject(env: Env, storageKey: string): Promise<void> {
@@ -237,7 +237,7 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
   const task = await repo.get(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
 
-  if (task.status === "cancelled") return;
+  if (String(task.status) === "cancelled") return;
   if (task.status === "delivered" || task.status === "delivery_unknown") return;
   if (task.status === "delivering") {
     await repo.update(taskId, {
