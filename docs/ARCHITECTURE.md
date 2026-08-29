@@ -287,7 +287,7 @@ Candidate scoring considers:
 
 Source quality cannot outweigh an obviously wrong work/language match.
 
-Candidates are deduplicated across providers using ISBN + language + format when possible, otherwise normalized title + author + language + format.
+Candidates are deduplicated across providers using ISBN + language + format when possible. Without a shared ISBN, the provider edition key remains part of the fallback key so distinct translations, publishers or revisions are not silently merged.
 
 If the best result is not sufficiently stronger than alternatives, the task pauses at `needs_selection` instead of blindly sending.
 
@@ -299,6 +299,8 @@ If the best result is not sufficiently stronger than alternatives, the task paus
 - `telegram_image` — image recognition before a book task exists.
 
 Vision jobs are deliberately acknowledged after one attempt rather than auto-retried. Book jobs retain retry behavior for failures before delivery begins.
+
+If the Telegram webhook cannot enqueue a new text/image job, it removes any incomplete task/link created before that failure and releases the `update_id` claim so Telegram can safely retry. Claims are not released after a Queue send succeeds, preventing duplicate work when only the acknowledgement message fails.
 
 Resolver/source calls use bounded timeouts and isolated failures to prevent one external service from monopolizing the Queue job.
 

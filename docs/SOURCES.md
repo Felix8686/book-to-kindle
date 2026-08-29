@@ -127,7 +127,7 @@ Language preference has enough weight to prefer a matching Chinese edition over 
 
 ## Deduplication
 
-Candidates are deduplicated across providers using ISBN when available, otherwise normalized title + author + language + format.
+Candidates are deduplicated across providers using ISBN when available. When no shared ISBN exists, the fallback key retains each provider's edition key; this favors showing an extra choice over incorrectly merging distinct editions.
 
 This prevents the same edition returned by multiple providers from creating a long list of nearly identical Telegram buttons.
 

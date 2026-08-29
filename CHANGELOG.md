@@ -14,6 +14,13 @@ The project follows Semantic Versioning while it is practical to do so.
 - optional Amazon catalog resolver using supported API credentials
 - additional verified public/open-access source adapters
 
+## [0.5.1] - 2026-08-29
+
+### Fixed
+- preserve distinct editions when candidates do not share an ISBN instead of collapsing them solely by title, author, language and format
+- prevent a source-selection callback racing with cancellation from enqueueing work or reporting that sending will continue
+- remove incomplete Telegram tasks and release the update claim when Queue enqueue fails, allowing Telegram's retry to recover safely
+
 ## [0.5.0] - 2026-08-29
 
 ### Added

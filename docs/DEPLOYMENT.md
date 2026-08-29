@@ -150,7 +150,7 @@ Health check:
 curl https://<your-worker>.workers.dev/health
 ```
 
-A v0.5 deployment should report the active resolver/source inventory, for example:
+A v0.5.1 deployment should report the active resolver/source inventory, for example:
 
 ```json
 {
@@ -248,7 +248,7 @@ Design rules:
 
 ## I. Production acceptance checklist
 
-Before considering v0.5 complete in a real deployment:
+Before considering v0.5.1 complete in a real deployment:
 
 - [ ] Migrations `0001` through `0007` are applied.
 - [ ] `npm run typecheck` passes.

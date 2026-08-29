@@ -293,6 +293,17 @@ class TelegramUpdateRepository {
 
     return Number(result.meta.changes ?? 0) > 0;
   }
+
+  async release(updateId: number): Promise<void> {
+    await this.db.prepare(`DELETE FROM telegram_updates WHERE update_id = ?1`).bind(updateId).run();
+  }
+}
+
+class TelegramQueueEnqueueError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "TelegramQueueEnqueueError";
+  }
 }
 
 function telegramApiUrl(env: Env, method: string): string {
@@ -536,7 +547,17 @@ async function createTelegramBookTask(input: {
     userId: input.userId,
     sourceMessageId: input.sourceMessageId,
   });
-  await input.env.TASK_QUEUE.send({ kind: "book", taskId });
+  try {
+    await input.env.TASK_QUEUE.send({ kind: "book", taskId });
+  } catch (error) {
+    // No Queue side effect was confirmed, so remove the incomplete task and
+    // let Telegram retry this update instead of leaving it stuck in queued.
+    await input.env.DB.batch([
+      input.env.DB.prepare(`DELETE FROM telegram_task_links WHERE task_id = ?1`).bind(taskId),
+      input.env.DB.prepare(`DELETE FROM tasks WHERE id = ?1`).bind(taskId),
+    ]);
+    throw new TelegramQueueEnqueueError("Could not enqueue Telegram book task.", { cause: error });
+  }
   return taskId;
 }
 
@@ -655,16 +676,20 @@ async function handleMessage(env: Env, message: TelegramMessage): Promise<void> 
       return;
     }
 
-    await env.TASK_QUEUE.send({
-      kind: "telegram_image",
-      chatId,
-      userId,
-      sourceMessageId: message.message_id,
-      fileId: image.fileId,
-      caption: message.caption?.trim().slice(0, 500),
-      declaredSizeBytes: image.declaredSizeBytes,
-      mimeType: image.mimeType,
-    });
+    try {
+      await env.TASK_QUEUE.send({
+        kind: "telegram_image",
+        chatId,
+        userId,
+        sourceMessageId: message.message_id,
+        fileId: image.fileId,
+        caption: message.caption?.trim().slice(0, 500),
+        declaredSizeBytes: image.declaredSizeBytes,
+        mimeType: image.mimeType,
+      });
+    } catch (error) {
+      throw new TelegramQueueEnqueueError("Could not enqueue Telegram image task.", { cause: error });
+    }
 
     await sendTelegramMessage(env, chatId, "收到图片，正在识别书名和作者……", {
       reply_to_message_id: message.message_id,
@@ -751,6 +776,11 @@ async function handleSourceCandidateCallback(
     selectedCandidate: selected,
     errorMessage: null,
   });
+  const latest = await repo.get(taskId);
+  if (String(latest?.status) === "cancelled") {
+    await answerCallbackQuery(env, callback.id, "任务已经取消，不能继续发送。");
+    return;
+  }
   await env.TASK_QUEUE.send({ kind: "book", taskId });
 
   await answerCallbackQuery(env, callback.id, "已选择，继续处理。");
@@ -1121,13 +1151,20 @@ export async function handleTelegramWebhook(request: Request, env: Env): Promise
     return new Response("invalid_update", { status: 400 });
   }
 
+  const updates = new TelegramUpdateRepository(env.DB);
   try {
-    const updates = new TelegramUpdateRepository(env.DB);
     if (!(await updates.claim(update.update_id))) return new Response("ok");
 
     if (update.message) await handleMessage(env, update.message);
     else if (update.callback_query) await handleCallbackQuery(env, update.callback_query);
   } catch (error) {
+    if (error instanceof TelegramQueueEnqueueError) {
+      try {
+        await updates.release(update.update_id);
+      } catch (releaseError) {
+        console.error("Could not release failed Telegram update claim", update.update_id, releaseError);
+      }
+    }
     console.error("Telegram update failed", update.update_id, error);
     return new Response("temporary_failure", { status: 500 });
   }

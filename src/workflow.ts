@@ -101,11 +101,17 @@ function candidateDedupKey(candidate: BookCandidate): string {
   const language = normalizeLanguage(candidate.language) ?? "";
   const format = candidate.format.toLowerCase();
   if (isbn13 || isbn10) return `isbn:${isbn13 ?? isbn10}:${language}:${format}`;
+  // Without a shared edition identifier, matching title/author/language/format
+  // is not enough evidence that two provider records are the same edition.
+  // Preserve source-specific editions rather than silently discarding a
+  // different translation, publisher or revision.
+  const edition = candidate.editionKey ?? `${candidate.source}:${candidate.id}`;
   return [
     normalizedText(candidate.title),
     normalizedText(candidate.author),
     language,
     format,
+    edition,
   ].join("|");
 }
 

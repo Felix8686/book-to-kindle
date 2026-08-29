@@ -53,7 +53,7 @@ Heavy repair/conversion tools such as Shelfmark, Calibre or CWA are deliberately
 
 ## Current status
 
-**v0.5.0 — language preferences, work resolution and multi-source discovery**
+**v0.5.1 — language preferences, multi-source discovery and cancellation/Queue reliability fixes**
 
 Implemented:
 
@@ -78,6 +78,8 @@ Implemented:
 - Google Books Free source;
 - Internet Archive public-access source;
 - cross-source normalization, ranking and deduplication;
+- edition-safe fallback deduplication when no shared ISBN is available;
+- Queue-enqueue recovery without leaving Telegram-created tasks stuck in `queued`;
 - GitHub Actions TypeScript validation.
 
 Still planned:

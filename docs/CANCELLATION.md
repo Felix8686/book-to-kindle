@@ -78,9 +78,10 @@ The implementation protects the cancellation decision in several ways:
 
 1. Task repository updates do not overwrite a task already marked `cancelled`.
 2. Workflow processing re-reads task state after search, before/after download staging, and immediately before Gmail delivery.
-3. If cancellation wins while an ebook is being staged, the temporary R2 object is deleted best-effort.
-4. If the transition to `delivering` wins first, cancellation is rejected as too late.
-5. A cancelled task does not become `failed` merely because in-flight work notices the cancellation while unwinding.
+3. Source-selection callbacks re-read the task after their guarded update; if cancellation won the race, they neither enqueue work nor claim that sending will continue.
+4. If cancellation wins while an ebook is being staged, the temporary R2 object is deleted best-effort.
+5. If the transition to `delivering` wins first, cancellation is rejected as too late.
+6. A cancelled task does not become `failed` merely because in-flight work notices the cancellation while unwinding.
 
 This favors truthful delivery state over pretending to provide an email/Kindle recall feature that does not exist.
 

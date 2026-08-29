@@ -204,7 +204,7 @@ delivery_unknown
 delivered
 ```
 
-The Queue workflow re-checks cancellation around resolver/source search, download, R2 staging and the Gmail boundary. A cancelled task cannot be restarted by an old source-selection callback.
+The Queue workflow re-checks cancellation around resolver/source search, download, R2 staging and the Gmail boundary. A cancelled task cannot be restarted by an old source-selection callback; the callback also re-reads final state before enqueueing or replying.
 
 Before image recognition has created a normal book task, the inline recognition `取消` button cancels only that recognition choice; it is separate from `/cancel` for an existing task.
 
@@ -252,6 +252,8 @@ The webhook validates `X-Telegram-Bot-Api-Secret-Token`.
 `0005_telegram_update_idempotency.sql` stores processed Telegram `update_id` values.
 
 Settings commands, cancellation commands, normal text requests, image messages and callbacks all share this idempotency boundary so Telegram retries cannot create duplicate book tasks or duplicate vision work.
+
+If Queue enqueue itself fails, incomplete task/link rows are removed and only that unconfirmed update claim is released. Telegram can then retry without leaving a permanent `queued` task. A successfully enqueued update keeps its claim even if a later acknowledgement message fails.
 
 ## 12. Security decisions
 
