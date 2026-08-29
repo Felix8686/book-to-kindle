@@ -27,3 +27,4 @@ dead_letter_queue = "book-to-kindle-dlq"
 [vars]
 APP_ENV = "production"
 TEMP_OBJECT_TTL_HOURS = "24"
+MAX_CLOUD_FILE_BYTES = "20971520"
