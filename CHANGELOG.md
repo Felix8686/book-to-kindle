@@ -11,8 +11,17 @@ The project follows Semantic Versioning while it is practical to do so.
 - Hermes Skill/MCP bridge
 - browser/share-sheet entry point
 - optional Shelfmark/CWA/Calibre enhancement node
-- richer delivery receipts and explicit retry controls
+- explicit user-controlled retry for uncertain deliveries
 - additional authorized/public-domain source adapters
+
+## [0.2.1] - 2026-08-29
+
+### Fixed
+- prevented automatic resend when Gmail delivery has started but its final outcome cannot be confirmed
+- added `delivery_unknown` task state for ambiguous delivery outcomes
+- persisted Gmail delivery receipts (`messageId`, `threadId`, accepted timestamp) after confirmed success
+- made EPUB/PDF signature validation robust when the first bytes arrive across multiple stream chunks
+- made R2 cleanup best-effort after confirmed delivery so cleanup failure cannot turn a successful Kindle send into a failed task
 
 ## [0.2.0] - 2026-08-29
 
