@@ -68,18 +68,48 @@ async function validatedBookStream(
   format: string,
 ): Promise<ReadableStream<Uint8Array>> {
   const reader = body.getReader();
-  const first = await reader.read();
-  if (first.done || !first.value || !hasValidSignature(format, first.value)) {
-    await reader.cancel("Invalid ebook signature");
-    throw new Error(`Downloaded content does not look like a valid ${format.toUpperCase()} file.`);
+  const buffered: Uint8Array[] = [];
+  let bufferedBytes = 0;
+
+  try {
+    while (bufferedBytes < 5) {
+      const next = await reader.read();
+      if (next.done) break;
+      buffered.push(next.value);
+      bufferedBytes += next.value.byteLength;
+    }
+
+    const header = new Uint8Array(Math.min(bufferedBytes, 5));
+    let offset = 0;
+    for (const chunk of buffered) {
+      if (offset >= header.byteLength) break;
+      const count = Math.min(chunk.byteLength, header.byteLength - offset);
+      header.set(chunk.subarray(0, count), offset);
+      offset += count;
+    }
+
+    if (!hasValidSignature(format, header)) {
+      await reader.cancel("Invalid ebook signature");
+      throw new Error(`Downloaded content does not look like a valid ${format.toUpperCase()} file.`);
+    }
+  } catch (error) {
+    try {
+      await reader.cancel(error);
+    } catch {
+      // Ignore cancellation failures while preserving the original validation error.
+    }
+    throw error;
   }
 
+  let bufferedIndex = 0;
   return new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(first.value!);
-    },
     async pull(controller) {
       try {
+        if (bufferedIndex < buffered.length) {
+          controller.enqueue(buffered[bufferedIndex++]);
+          return;
+        }
+
         const next = await reader.read();
         if (next.done) {
           controller.close();
@@ -108,15 +138,18 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
   const task = await repo.get(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
 
-  if (task.status === "delivered") return;
+  if (task.status === "delivered" || task.status === "delivery_unknown") return;
   if (task.status === "delivering") {
     await repo.update(taskId, {
-      status: "failed",
-      errorMessage: "Previous delivery outcome is unknown; automatic resend was blocked to avoid duplicates.",
+      status: "delivery_unknown",
+      errorMessage:
+        "A previous Gmail delivery started but its final outcome is unknown. Automatic resend was blocked to avoid a duplicate Kindle document.",
     });
     return;
   }
   if (task.status === "needs_selection" && !task.selectedCandidate) return;
+
+  let deliveryStarted = false;
 
   try {
     let selected = task.selectedCandidate;
@@ -167,6 +200,7 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
       status: "downloading",
       candidates: null,
       selectedCandidate: selected,
+      deliveryReceipt: null,
       errorMessage: null,
     });
 
@@ -201,19 +235,48 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
     const object = await deps.env.FILES.get(storageKey);
     if (!object) throw new Error("Staged file disappeared from R2.");
 
-    await repo.update(taskId, { status: "delivering" });
-    await deps.delivery.deliver({
+    await repo.update(taskId, { status: "delivering", errorMessage: null });
+    deliveryStarted = true;
+
+    const receipt = await deps.delivery.deliver({
       task: (await repo.get(taskId))!,
       object,
       kindleEmail: deps.env.KINDLE_EMAIL,
     });
 
-    await repo.update(taskId, { status: "delivered", errorMessage: null });
-    await deps.env.FILES.delete(storageKey);
+    await repo.update(taskId, {
+      status: "delivered",
+      deliveryReceipt: receipt,
+      errorMessage: null,
+    });
+    deliveryStarted = false;
+
+    try {
+      await deps.env.FILES.delete(storageKey);
+    } catch (cleanupError) {
+      console.warn("Delivered task R2 cleanup failed", taskId, cleanupError);
+    }
   } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown workflow failure";
+
+    if (deliveryStarted) {
+      try {
+        await repo.update(taskId, {
+          status: "delivery_unknown",
+          errorMessage:
+            `Gmail delivery started but its final outcome could not be confirmed: ${message}. ` +
+            "Automatic resend was blocked to avoid a duplicate Kindle document.",
+        });
+        return;
+      } catch (stateError) {
+        console.error("Could not persist delivery_unknown state", taskId, stateError);
+        throw error;
+      }
+    }
+
     await repo.update(taskId, {
       status: "failed",
-      errorMessage: error instanceof Error ? error.message : "Unknown workflow failure",
+      errorMessage: message,
     });
     throw error;
   }
