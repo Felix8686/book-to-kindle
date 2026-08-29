@@ -170,8 +170,11 @@ This is 20 MiB. It intentionally leaves room below Gmail's normal personal-accou
 The source adapter also:
 
 - limits streamed downloads to this size;
+- prefers Project Gutenberg's standard no-images EPUB variant when available;
 - restricts download hosts to `gutenberg.org`;
 - validates EPUB/PDF signatures before R2 staging, even if the signature arrives across multiple stream chunks.
+
+R2 staging supplies the known content length through `FixedLengthStream` when the source provides one; otherwise it uses a bounded buffer that remains within the same cloud-size guardrail.
 
 If a future source supplies a file that needs native repair/conversion or is too large for this path, the workflow should delegate it to the optional local enhancement node instead of forcing Cloudflare to process it.
 

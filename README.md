@@ -49,7 +49,7 @@ Cloudflare is the always-on control plane, not a VPS replacement. Heavy ebook re
 
 ## Current status
 
-**v0.2.1 — first end-to-end cloud path with conservative delivery idempotency**
+**v0.2.2 — first end-to-end cloud path with conservative delivery idempotency**
 
 Implemented:
 
@@ -207,6 +207,7 @@ The first bundled provider is **Gutendex**, an API over Project Gutenberg metada
 - requests only entries marked `copyright=false` by Gutendex;
 - supports title/author search and language filtering;
 - exposes EPUB/PDF candidates;
+- prefers Project Gutenberg's standard no-images EPUB variant for the cloud path;
 - only follows HTTPS downloads hosted under `gutenberg.org`;
 - validates EPUB/PDF file signatures before R2 staging.
 

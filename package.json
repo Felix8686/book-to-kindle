@@ -1,6 +1,6 @@
 {
   "name": "book-to-kindle",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "Cloudflare-first, local-capable workflow for delivering ebooks to Kindle.",
   "type": "module",

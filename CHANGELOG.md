@@ -6,6 +6,10 @@ The project follows Semantic Versioning while it is practical to do so.
 
 ## [Unreleased]
 
+### Fixed
+- prefer the smaller standard no-images Project Gutenberg EPUB variant so compatible public-domain books are not rejected after downloading an oversized image edition
+- provide R2 with a known content length when staging streamed downloads
+
 ### Planned
 - Telegram webhook entry point
 - Hermes Skill/MCP bridge

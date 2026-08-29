@@ -6,7 +6,7 @@ workers_dev = true
 [[d1_databases]]
 binding = "DB"
 database_name = "book-to-kindle"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "1297e26c-c5b5-42c3-929d-bf0dfd7b8992"
 migrations_dir = "migrations"
 
 [[r2_buckets]]

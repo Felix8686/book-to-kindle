@@ -40,7 +40,15 @@ function formatsFor(book: GutendexBook): Array<{ format: "epub" | "pdf"; content
   const output: Array<{ format: "epub" | "pdf"; contentType: string; url: string }> = [];
 
   const epub = book.formats["application/epub+zip"];
-  if (epub) output.push({ format: "epub", contentType: "application/epub+zip", url: epub });
+  if (epub) {
+    // Gutendex commonly returns the image-heavy EPUB3 variant. Prefer Gutenberg's
+    // standard no-images EPUB so valid public-domain books stay within the cloud limit.
+    output.push({
+      format: "epub",
+      contentType: "application/epub+zip",
+      url: `https://www.gutenberg.org/cache/epub/${book.id}/pg${book.id}.epub`,
+    });
+  }
 
   const pdf = book.formats["application/pdf"];
   if (pdf) output.push({ format: "pdf", contentType: "application/pdf", url: pdf });

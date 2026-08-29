@@ -214,14 +214,27 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
     const validatedBody = await validatedBookStream(download.body, selected.format.toLowerCase());
     const extension = selected.format.toLowerCase();
     const storageKey = `tasks/${taskId}/${crypto.randomUUID()}.${extension}`;
-    await deps.env.FILES.put(storageKey, validatedBody, {
+    const storageOptions = {
       httpMetadata: { contentType: download.contentType },
       customMetadata: {
         taskId,
         source: selected.source,
         title: selected.title.slice(0, 200),
       },
-    });
+    };
+
+    if (download.sizeBytes !== undefined) {
+      const fixedLength = new FixedLengthStream(download.sizeBytes);
+      await Promise.all([
+        deps.env.FILES.put(storageKey, fixedLength.readable, storageOptions),
+        validatedBody.pipeTo(fixedLength.writable),
+      ]);
+    } else {
+      // R2 needs a known length for arbitrary streams. The source has already
+      // been capped by maxCloudFileBytes, so this bounded fallback is safe.
+      const bufferedBody = await new Response(validatedBody).arrayBuffer();
+      await deps.env.FILES.put(storageKey, bufferedBody, storageOptions);
+    }
     await repo.update(taskId, { status: "staged", storageKey });
 
     if (!deps.delivery || !deps.env.KINDLE_EMAIL) {

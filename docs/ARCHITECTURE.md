@@ -65,7 +65,7 @@ Queue jobs can:
 - rank candidates;
 - pause in `needs_selection`;
 - download a compatible file;
-- validate and stage it in R2;
+- validate and stage it in R2 with a known object length;
 - invoke delivery;
 - retry failures that happen before delivery begins.
 
@@ -134,6 +134,7 @@ Safety and scope rules:
 
 - request `copyright=false` entries;
 - return only EPUB/PDF candidates;
+- prefer Project Gutenberg's standard no-images EPUB variant for the cloud path;
 - restrict actual downloads to HTTPS hosts under `gutenberg.org`;
 - stream downloads through a byte limit;
 - validate EPUB ZIP or PDF signatures before R2 staging, including when signature bytes are split across stream chunks.
