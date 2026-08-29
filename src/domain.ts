@@ -8,7 +8,6 @@ export type TaskStatus =
   | "delivering"
   | "delivery_unknown"
   | "delivered"
-  | "cancelled"
   | "failed";
 
 export interface BookRequest {
