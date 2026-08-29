@@ -133,10 +133,10 @@ Current migrations:
 0002_candidates.sql
 0003_delivery_receipt.sql
 0004_telegram_entry.sql
-0005_telegram_image_choices.sql
+0006_telegram_image_choices.sql
 ```
 
-`0005` stores only temporary recognition choices/metadata; the source image itself is not persisted there.
+`0006` stores only temporary recognition choices/metadata; the source image itself is not persisted there.
 
 ---
 

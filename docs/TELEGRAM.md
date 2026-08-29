@@ -52,7 +52,7 @@ Never commit these values.
 ## 2. Apply migrations
 
 Telegram text entry uses `0004_telegram_entry.sql`.
-Image recognition choices use `0005_telegram_image_choices.sql`.
+Image recognition choices use `0006_telegram_image_choices.sql`.
 
 ```bash
 npm run db:migrate:remote

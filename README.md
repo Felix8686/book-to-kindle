@@ -322,7 +322,7 @@ Apply all migrations before deploying:
 0002_candidates.sql
 0003_delivery_receipt.sql
 0004_telegram_entry.sql
-0005_telegram_image_choices.sql
+0006_telegram_image_choices.sql
 ```
 
 Then:
@@ -371,7 +371,7 @@ migrations/
   0002_candidates.sql
   0003_delivery_receipt.sql
   0004_telegram_entry.sql
-  0005_telegram_image_choices.sql
+  0006_telegram_image_choices.sql
 docs/
   ARCHITECTURE.md
   DEPLOYMENT.md
