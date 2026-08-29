@@ -40,6 +40,8 @@ See [`GMAIL_OAUTH.md`](GMAIL_OAUTH.md) for OAuth setup.
 npm run db:migrate:local
 ```
 
+This applies the task schema, candidate persistence, and delivery-receipt migration.
+
 ### 4. Start
 
 ```bash
@@ -76,6 +78,10 @@ curl -X POST http://localhost:8787/api/v1/tasks/<TASK_ID>/select \
   -H "Content-Type: application/json" \
   -d '{"candidateId":"gutenberg:1342:epub"}'
 ```
+
+A successful task reaches `delivered` and may include a Gmail `deliveryReceipt` with message/thread IDs.
+
+If a task reaches `delivery_unknown`, do not blindly resend it. Check Gmail Sent and the Kindle library first; the state deliberately blocks automatic resend because the previous delivery may already have succeeded.
 
 ---
 
@@ -129,7 +135,7 @@ Never place OAuth credentials in `wrangler.toml` or commit them to Git.
 npm run db:migrate:remote
 ```
 
-This applies both the initial task schema and the candidate-list migration.
+This applies all current migrations, including candidate lists and Gmail delivery receipts.
 
 ### 7. Deploy
 
@@ -147,7 +153,7 @@ A fully configured deployment should report Gmail delivery as configured.
 
 ### 9. Run an end-to-end test
 
-Submit the same `Pride and Prejudice` request used in local mode, then poll its task ID until it reaches `delivered`, `needs_selection`, `needs_source`, or `failed`.
+Submit the same `Pride and Prejudice` request used in local mode, then poll its task ID until it reaches `delivered`, `delivery_unknown`, `needs_selection`, `needs_source`, or `failed`.
 
 ---
 
@@ -165,7 +171,7 @@ The source adapter also:
 
 - limits streamed downloads to this size;
 - restricts download hosts to `gutenberg.org`;
-- validates EPUB/PDF signatures before R2 staging.
+- validates EPUB/PDF signatures before R2 staging, even if the signature arrives across multiple stream chunks.
 
 If a future source supplies a file that needs native repair/conversion or is too large for this path, the workflow should delegate it to the optional local enhancement node instead of forcing Cloudflare to process it.
 
@@ -197,12 +203,14 @@ Before exposing the service publicly:
 
 - [ ] Replace the placeholder D1 database ID.
 - [ ] Configure a strong `API_TOKEN`.
-- [ ] Apply all D1 migrations.
+- [ ] Apply all D1 migrations (`0001` through `0003`).
 - [ ] Configure Gmail OAuth secrets.
 - [ ] Confirm the Gmail sender is permitted by Amazon Send to Kindle settings.
 - [ ] Verify the correct Kindle Send-to-Kindle email address.
 - [ ] Run at least one successful public-domain EPUB delivery.
+- [ ] Verify the response contains a delivery receipt when Gmail returns message metadata.
 - [ ] Verify `needs_selection` can be resolved through the selection API.
+- [ ] Verify `delivery_unknown` never causes an automatic resend.
 - [ ] Configure an R2 lifecycle rule as a second safety net for stale temporary objects.
 - [ ] Keep Telegram disabled until webhook secret verification is implemented.
-- [ ] Review queue/dead-letter failures before adding automatic retry controls for delivery.
+- [ ] Review queue/dead-letter failures before adding explicit retry controls for uncertain delivery.
