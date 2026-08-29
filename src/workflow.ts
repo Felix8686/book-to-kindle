@@ -30,7 +30,7 @@ export function candidateScore(candidate: BookCandidate, task: TaskRecord): numb
   }
 
   if (task.request.preferredFormat && candidate.format === task.request.preferredFormat) score += 10;
-  if (candidate.sizeBytes && candidate.sizeBytes > maxCloudFileBytes({} as Env)) score -= 100;
+  if (candidate.sizeBytes && candidate.sizeBytes > DEFAULT_MAX_CLOUD_FILE_BYTES) score -= 100;
 
   return score;
 }
@@ -49,6 +49,52 @@ function autoSelect(ranked: BookCandidate[]): BookCandidate | null {
   if ((best.score ?? 0) < 40) return null;
   if (second && (best.score ?? 0) - (second.score ?? 0) < 10) return null;
   return best;
+}
+
+function hasValidSignature(format: string, bytes: Uint8Array): boolean {
+  if (format === "pdf") {
+    return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2d;
+  }
+
+  if (format === "epub") {
+    return bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
+  }
+
+  return false;
+}
+
+async function validatedBookStream(
+  body: ReadableStream<Uint8Array>,
+  format: string,
+): Promise<ReadableStream<Uint8Array>> {
+  const reader = body.getReader();
+  const first = await reader.read();
+  if (first.done || !first.value || !hasValidSignature(format, first.value)) {
+    await reader.cancel("Invalid ebook signature");
+    throw new Error(`Downloaded content does not look like a valid ${format.toUpperCase()} file.`);
+  }
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(first.value!);
+    },
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (next.done) {
+          controller.close();
+          reader.releaseLock();
+          return;
+        }
+        controller.enqueue(next.value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason);
+    },
+  });
 }
 
 export interface WorkflowDependencies {
@@ -113,7 +159,8 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
       }
     }
 
-    const source = deps.sources.find((item) => item.name === selected!.source);
+    if (!selected) throw new Error("No book candidate was selected.");
+    const source = deps.sources.find((item) => item.name === selected.source);
     if (!source) throw new Error(`Missing source adapter: ${selected.source}`);
 
     await repo.update(taskId, {
@@ -130,9 +177,10 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
       throw new Error("File is too large for the Cloudflare delivery path; use a local enhancement node.");
     }
 
+    const validatedBody = await validatedBookStream(download.body, selected.format.toLowerCase());
     const extension = selected.format.toLowerCase();
     const storageKey = `tasks/${taskId}/${crypto.randomUUID()}.${extension}`;
-    await deps.env.FILES.put(storageKey, download.body, {
+    await deps.env.FILES.put(storageKey, validatedBody, {
       httpMetadata: { contentType: download.contentType },
       customMetadata: {
         taskId,
