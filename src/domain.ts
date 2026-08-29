@@ -8,6 +8,7 @@ export type TaskStatus =
   | "delivering"
   | "delivery_unknown"
   | "delivered"
+  | "cancelled"
   | "failed";
 
 export interface BookRequest {
@@ -15,6 +16,33 @@ export interface BookRequest {
   author?: string;
   language?: string;
   preferredFormat?: "epub" | "pdf";
+}
+
+export interface BookIdentifiers {
+  isbn10?: string[];
+  isbn13?: string[];
+  openLibraryWorkKeys?: string[];
+  googleVolumeIds?: string[];
+}
+
+export interface BookTitleVariant {
+  title: string;
+  language?: string;
+  source: "request" | "openlibrary" | "google-books";
+}
+
+export interface BookIdentity {
+  canonicalTitle: string;
+  authors: string[];
+  titles: BookTitleVariant[];
+  identifiers: BookIdentifiers;
+}
+
+export interface BookSearchContext {
+  request: BookRequest;
+  preferredLanguage: string;
+  identity: BookIdentity;
+  queryVariants: string[];
 }
 
 export interface BookCandidate {
@@ -26,6 +54,9 @@ export interface BookCandidate {
   sizeBytes?: number;
   source: string;
   sourceRef: string;
+  identifiers?: BookIdentifiers;
+  editionKey?: string;
+  sourceQuality?: number;
   score?: number;
 }
 
@@ -69,7 +100,7 @@ export type TaskQueueMessage = BookTaskQueueMessage | TelegramImageQueueMessage;
 
 export interface SourceAdapter {
   name: string;
-  search(request: BookRequest): Promise<BookCandidate[]>;
+  search(context: BookSearchContext): Promise<BookCandidate[]>;
   download(
     candidate: BookCandidate,
     options?: { maxBytes?: number },
