@@ -1,5 +1,15 @@
-import type { BookCandidate, DeliveryAdapter, Env, SourceAdapter, TaskRecord } from "./domain";
+import type {
+  BookCandidate,
+  BookIdentifiers,
+  BookSearchContext,
+  DeliveryAdapter,
+  Env,
+  SourceAdapter,
+  TaskRecord,
+} from "./domain";
 import { TaskRepository } from "./repository";
+import { resolveBookSearchContext } from "./resolver";
+import { normalizeBookLanguage, preferredLanguageForTask } from "./settings";
 
 const DEFAULT_MAX_CLOUD_FILE_BYTES = 20 * 1024 * 1024;
 
@@ -9,35 +19,112 @@ function maxCloudFileBytes(env: Env): number {
   return Math.min(configured, 24 * 1024 * 1024);
 }
 
-export function candidateScore(candidate: BookCandidate, task: TaskRecord): number {
+function normalizeLanguage(value?: string): string | undefined {
+  if (!value) return undefined;
+  const known = normalizeBookLanguage(value);
+  if (known) return known;
+  const raw = value.trim().toLowerCase();
+  if (raw === "eng") return "en";
+  if (["chi", "zho"].includes(raw)) return "zh";
+  return raw.slice(0, 2);
+}
+
+function normalizedText(value?: string): string {
+  return (value ?? "")
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function identifierValues(identifiers?: BookIdentifiers): Set<string> {
+  return new Set([
+    ...(identifiers?.isbn10 ?? []),
+    ...(identifiers?.isbn13 ?? []),
+  ].map((value) => value.replace(/[^0-9X]/gi, "")));
+}
+
+function hasIdentifierOverlap(candidate: BookCandidate, context: BookSearchContext): boolean {
+  const candidateIds = identifierValues(candidate.identifiers);
+  if (candidateIds.size === 0) return false;
+  const identityIds = identifierValues(context.identity.identifiers);
+  return [...candidateIds].some((value) => identityIds.has(value));
+}
+
+export function candidateScore(
+  candidate: BookCandidate,
+  task: TaskRecord,
+  context?: BookSearchContext,
+): number {
   let score = 0;
-  const query = task.request.query.toLowerCase();
-  const title = candidate.title.toLowerCase();
+  const candidateTitle = normalizedText(candidate.title);
+  const titleVariants = context?.identity.titles.map((item) => item.title) ?? [task.request.query];
+  const normalizedVariants = titleVariants.map(normalizedText).filter(Boolean);
 
-  if (title === query) score += 50;
-  else if (title.includes(query) || query.includes(title)) score += 30;
+  if (normalizedVariants.some((title) => title === candidateTitle)) score += 45;
+  else if (
+    normalizedVariants.some((title) => title.includes(candidateTitle) || candidateTitle.includes(title))
+  ) score += 28;
 
-  if (task.request.author && candidate.author) {
-    const requestedAuthor = task.request.author.toLowerCase();
-    const author = candidate.author.toLowerCase();
-    if (author.includes(requestedAuthor) || requestedAuthor.includes(author)) score += 25;
+  const requestedAuthors = context?.identity.authors.length
+    ? context.identity.authors
+    : task.request.author
+      ? [task.request.author]
+      : [];
+  if (candidate.author && requestedAuthors.length) {
+    const author = normalizedText(candidate.author);
+    if (requestedAuthors.some((value) => {
+      const requested = normalizedText(value);
+      return author.includes(requested) || requested.includes(author);
+    })) score += 25;
   }
 
-  if (task.request.language && candidate.language) {
-    const requestedLanguage = task.request.language.toLowerCase();
-    const language = candidate.language.toLowerCase();
-    if (language === requestedLanguage || language.startsWith(requestedLanguage.slice(0, 2))) score += 15;
-  }
+  if (context && hasIdentifierOverlap(candidate, context)) score += 50;
+
+  const preferredLanguage = context?.preferredLanguage ?? normalizeLanguage(task.request.language);
+  const candidateLanguage = normalizeLanguage(candidate.language);
+  if (preferredLanguage && candidateLanguage === preferredLanguage) score += 30;
 
   if (task.request.preferredFormat && candidate.format === task.request.preferredFormat) score += 10;
+  else if (!task.request.preferredFormat && candidate.format === "epub") score += 8;
+
+  score += Math.min(Math.max(candidate.sourceQuality ?? 0, 0), 15);
   if (candidate.sizeBytes && candidate.sizeBytes > DEFAULT_MAX_CLOUD_FILE_BYTES) score -= 100;
 
   return score;
 }
 
-function rankedCandidates(candidates: BookCandidate[], task: TaskRecord): BookCandidate[] {
-  return candidates
-    .map((candidate) => ({ ...candidate, score: candidateScore(candidate, task) }))
+function candidateDedupKey(candidate: BookCandidate): string {
+  const isbn13 = candidate.identifiers?.isbn13?.[0]?.replace(/[^0-9X]/gi, "");
+  const isbn10 = candidate.identifiers?.isbn10?.[0]?.replace(/[^0-9X]/gi, "");
+  const language = normalizeLanguage(candidate.language) ?? "";
+  const format = candidate.format.toLowerCase();
+  if (isbn13 || isbn10) return `isbn:${isbn13 ?? isbn10}:${language}:${format}`;
+  return [
+    normalizedText(candidate.title),
+    normalizedText(candidate.author),
+    language,
+    format,
+  ].join("|");
+}
+
+function rankedCandidates(
+  candidates: BookCandidate[],
+  task: TaskRecord,
+  context: BookSearchContext,
+): BookCandidate[] {
+  const deduped = new Map<string, BookCandidate>();
+  for (const candidate of candidates) {
+    const key = candidateDedupKey(candidate);
+    const existing = deduped.get(key);
+    if (!existing || (candidate.sourceQuality ?? 0) > (existing.sourceQuality ?? 0)) {
+      deduped.set(key, candidate);
+    }
+  }
+
+  return [...deduped.values()]
+    .map((candidate) => ({ ...candidate, score: candidateScore(candidate, task, context) }))
     .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
 }
 
@@ -46,8 +133,8 @@ function autoSelect(ranked: BookCandidate[]): BookCandidate | null {
   const best = ranked[0];
   const second = ranked[1];
 
-  if ((best.score ?? 0) < 40) return null;
-  if (second && (best.score ?? 0) - (second.score ?? 0) < 10) return null;
+  if ((best.score ?? 0) < 55) return null;
+  if (second && (best.score ?? 0) - (second.score ?? 0) < 12) return null;
   return best;
 }
 
@@ -96,7 +183,7 @@ async function validatedBookStream(
     try {
       await reader.cancel(error);
     } catch {
-      // Ignore cancellation failures while preserving the original validation error.
+      // Preserve the original validation error.
     }
     throw error;
   }
@@ -109,7 +196,6 @@ async function validatedBookStream(
           controller.enqueue(buffered[bufferedIndex++]);
           return;
         }
-
         const next = await reader.read();
         if (next.done) {
           controller.close();
@@ -129,7 +215,7 @@ async function validatedBookStream(
 
 async function isCancelled(repo: TaskRepository, taskId: string): Promise<boolean> {
   const latest = await repo.get(taskId);
-  return Boolean(latest && String(latest.status) === "cancelled");
+  return Boolean(latest && latest.status === "cancelled");
 }
 
 async function cleanupCancelledObject(env: Env, storageKey: string): Promise<void> {
@@ -151,7 +237,7 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
   const task = await repo.get(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
 
-  if (String(task.status) === "cancelled") return;
+  if (task.status === "cancelled") return;
   if (task.status === "delivered" || task.status === "delivery_unknown") return;
   if (task.status === "delivering") {
     await repo.update(taskId, {
@@ -181,20 +267,26 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
         return;
       }
 
-      const resultSets = await Promise.all(
-        deps.sources.map(async (source) => {
-          try {
-            return await source.search(task.request);
-          } catch (error) {
-            console.warn(`Source ${source.name} failed`, error);
-            return [];
-          }
-        }),
+      const preferredLanguage = await preferredLanguageForTask(
+        deps.env,
+        taskId,
+        task.request.language,
       );
+      const context = await resolveBookSearchContext(task.request, preferredLanguage);
+      if (await isCancelled(repo, taskId)) return;
+
+      const resultSets = await Promise.allSettled(
+        deps.sources.map((source) => source.search(context)),
+      );
+      const candidates: BookCandidate[] = [];
+      resultSets.forEach((result, index) => {
+        if (result.status === "fulfilled") candidates.push(...result.value);
+        else console.warn(`Source ${deps.sources[index]?.name ?? index} failed`, result.reason);
+      });
 
       if (await isCancelled(repo, taskId)) return;
 
-      const ranked = rankedCandidates(resultSets.flat(), task).slice(0, 10);
+      const ranked = rankedCandidates(candidates, task, context).slice(0, 10);
       selected = autoSelect(ranked) ?? undefined;
 
       if (!selected) {
@@ -203,8 +295,8 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
           candidates: ranked.length > 0 ? ranked : null,
           errorMessage:
             ranked.length > 0
-              ? "Multiple or low-confidence candidates require confirmation."
-              : "No compatible public-domain source was found.",
+              ? "Multiple or low-confidence editions require confirmation."
+              : "No compatible downloadable source was found.",
         });
         return;
       }
@@ -230,7 +322,7 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
       try {
         await download.body.cancel("Task cancelled by user");
       } catch {
-        // Best effort only; the task is already terminally cancelled.
+        // Best effort only.
       }
       return;
     }
@@ -259,8 +351,6 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
         validatedBody.pipeTo(fixedLength.writable),
       ]);
     } else {
-      // R2 needs a known length for arbitrary streams. The source has already
-      // been capped by maxCloudFileBytes, so this bounded fallback is safe.
       const bufferedBody = await new Response(validatedBody).arrayBuffer();
       await deps.env.FILES.put(storageKey, bufferedBody, storageOptions);
     }
@@ -289,9 +379,6 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
     const object = await deps.env.FILES.get(storageKey);
     if (!object) throw new Error("Staged file disappeared from R2.");
 
-    // Cancellation and the transition into delivery race on the same D1 status.
-    // TaskRepository.update cannot overwrite 'cancelled', so whichever state wins
-    // is authoritative. Gmail is invoked only after we re-read that decision.
     await repo.update(taskId, { status: "delivering", errorMessage: null });
     if (await isCancelled(repo, taskId)) {
       await cleanupCancelledObject(deps.env, storageKey);
@@ -300,7 +387,6 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
     }
 
     deliveryStarted = true;
-
     const receipt = await deps.delivery.deliver({
       task: (await repo.get(taskId))!,
       object,
@@ -327,7 +413,6 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
     }
 
     const message = error instanceof Error ? error.message : "Unknown workflow failure";
-
     if (deliveryStarted) {
       try {
         await repo.update(taskId, {
