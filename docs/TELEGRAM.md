@@ -1,63 +1,58 @@
 # Telegram entrypoint
 
-Book to Kindle v0.3 adds a Telegram Bot webhook directly to the Cloudflare Worker.
-
-The intended path is:
+Book to Kindle v0.4 exposes a Telegram Bot webhook directly on the Cloudflare Worker. Text requests and images both enter the same book workflow.
 
 ```text
 Telegram user
     |
-    v
-/telegram/webhook
-    |
-    v
-Cloudflare Worker
-    |
-    +--> D1 task + Telegram task mapping
-    |
-    +--> Queue
-            |
-            v
-      normal book workflow
-            |
-            v
-          Kindle
+    +--> text request -------------------+
+    |                                    |
+    +--> photo / image file              |
+             |                           |
+             v                           |
+       Queue vision job                  |
+             |                           |
+       Workers AI vision                 |
+             |                           |
+       title / author                    |
+             +---------------------------+
+                         |
+                         v
+                   D1 book task
+                         |
+                         v
+                       Queue
+                         |
+                         v
+                 normal book workflow
+                         |
+                         v
+                       Kindle
 ```
 
 Hermes is not required for this path. The Telegram bot remains usable while the user's PC is off.
 
-## 1. Create a bot
+## 1. Required Telegram secrets
 
-Create a bot with Telegram's official `@BotFather` and obtain the bot token.
-
-Do not commit the token to Git.
-
-## 2. Generate a webhook secret
-
-Telegram `setWebhook` supports a `secret_token`. Telegram then includes the value in the `X-Telegram-Bot-Api-Secret-Token` request header. The Worker rejects webhook calls whose header does not match.
-
-The secret may only contain `A-Z`, `a-z`, `0-9`, `_` and `-`.
-
-One way to generate a suitable value locally:
-
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
-```
-
-Keep this value private.
-
-## 3. Configure Cloudflare secrets
+Create a bot with Telegram's official `@BotFather`, then configure:
 
 ```bash
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 ```
 
-`TELEGRAM_ALLOWED_USER_IDS` is deliberately configured separately after `/whoami` is available.
+Generate `TELEGRAM_WEBHOOK_SECRET` with characters accepted by Telegram (`A-Z`, `a-z`, `0-9`, `_`, `-`). Example:
 
-## 4. Apply the Telegram migration
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+```
 
-The Telegram entrypoint uses `migrations/0004_telegram_entry.sql`.
+Never commit these values.
+
+## 2. Apply migrations
+
+Telegram text entry uses `0004_telegram_entry.sql`.
+Image recognition choices use `0005_telegram_image_choices.sql`.
 
 ```bash
 npm run db:migrate:remote
@@ -69,29 +64,51 @@ For local development:
 npm run db:migrate:local
 ```
 
-## 5. Deploy
+## 3. Workers AI binding
+
+`wrangler.toml` contains:
+
+```toml
+[ai]
+binding = "AI"
+```
+
+The current vision model is:
+
+```text
+@cf/meta/llama-3.2-11b-vision-instruct
+```
+
+Cloudflare requires accepting Meta's model license once before first use. Complete that account-level step before image testing. The model is called through the Worker AI binding; no separate VPS or GPU service is required.
+
+Workers AI currently includes a free daily allocation. Image recognition is deliberately only invoked when an authorized user actually sends an image.
+
+## 4. Image-size guardrail
+
+The default configuration is:
+
+```toml
+MAX_TELEGRAM_IMAGE_BYTES = "4194304"
+```
+
+That is 4 MiB. Code also enforces a hard 6 MiB ceiling.
+
+This keeps base64 conversion and vision inference inside a conservative Worker memory/CPU envelope. Telegram's normal photo mode usually compresses images below this limit.
+
+Supported image inputs:
+
+- Telegram photos;
+- JPEG image documents;
+- PNG image documents;
+- WebP image documents.
+
+Other files are rejected instead of being passed blindly to Workers AI.
+
+## 5. Deploy and register webhook
 
 ```bash
 npm run deploy
 ```
-
-Verify:
-
-```text
-GET https://<worker>.workers.dev/health
-```
-
-The response should contain:
-
-```json
-{
-  "telegram": "configured"
-}
-```
-
-This only means the bot token and webhook secret exist. User authorization is controlled separately.
-
-## 6. Register the webhook
 
 Webhook URL:
 
@@ -99,157 +116,144 @@ Webhook URL:
 https://<worker>.workers.dev/telegram/webhook
 ```
 
-Register only the update types currently used by the project:
+Register only:
 
 - `message`
 - `callback_query`
 
-Example with curl:
+Use the same `TELEGRAM_WEBHOOK_SECRET` as Telegram's `secret_token`.
 
-```bash
-curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://<worker>.workers.dev/telegram/webhook",
-    "secret_token": "<TELEGRAM_WEBHOOK_SECRET>",
-    "allowed_updates": ["message", "callback_query"],
-    "drop_pending_updates": true
-  }'
-```
+## 6. Bootstrap the user allowlist
 
-PowerShell example:
+Before the allowlist is configured, `/whoami` remains available.
 
-```powershell
-$body = @{
-  url = "https://<worker>.workers.dev/telegram/webhook"
-  secret_token = "<TELEGRAM_WEBHOOK_SECRET>"
-  allowed_updates = @("message", "callback_query")
-  drop_pending_updates = $true
-} | ConvertTo-Json
-
-Invoke-RestMethod \
-  -Method Post \
-  -Uri "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
-  -ContentType "application/json" \
-  -Body $body
-```
-
-A successful response contains `"ok": true`.
-
-## 7. Find your Telegram user ID
-
-Before the allowlist is configured, `/whoami` is intentionally still available.
-
-Open a private chat with the bot and send:
+Send:
 
 ```text
 /whoami
 ```
 
-The bot replies with your numeric Telegram user ID.
-
-Other task commands remain blocked until an allowlist is configured.
-
-## 8. Configure the allowlist
-
-For a personal deployment:
+Then configure the returned numeric ID:
 
 ```bash
 npx wrangler secret put TELEGRAM_ALLOWED_USER_IDS
 ```
 
-Enter the numeric ID returned by `/whoami`.
+Multiple IDs may be comma-separated. If the allowlist is empty, normal task creation and image recognition remain denied by default.
 
-Multiple users may be comma-separated:
+## 7. Text usage
 
-```text
-123456789,987654321
-```
-
-If this secret is empty or absent, nobody can create book tasks through Telegram. `/whoami` remains available so the deployment can be bootstrapped safely.
-
-## 9. User experience
-
-The bot currently supports private chats only.
-
-### Direct title
+Examples:
 
 ```text
 Pride and Prejudice
 ```
 
-### Natural-language request
-
 ```text
 把《Pride and Prejudice》发到 Kindle
 ```
-
-### Format preference
 
 ```text
 《The Little Prince》 PDF
 ```
 
-EPUB is the default format preference.
-
-### Explicit command
+Commands:
 
 ```text
-/send Pride and Prejudice
-```
-
-### Check the latest task
-
-```text
+/send <书名>
 /status
-```
-
-### Help
-
-```text
+/whoami
 /help
 ```
 
-## 10. Ambiguous editions
+## 8. Image usage
 
-If the workflow reaches `needs_selection`, Telegram sends inline buttons for the highest-ranked candidates.
+Send a clear book cover, reading-app screenshot, bookstore photo, or book-list screenshot directly to the bot.
 
-Selecting a button:
+The bot immediately acknowledges the image, then a Queue consumer performs:
 
-1. verifies the Telegram user matches the original requester;
-2. verifies the callback comes from the original chat;
-3. records the selected candidate;
-4. re-queues the same task;
-5. continues download and delivery.
+1. Telegram `getFile`;
+2. bounded image download;
+3. JPEG/PNG/WebP signature validation;
+4. Workers AI vision inference;
+5. title/author extraction;
+6. conversion into the normal `BookRequest` workflow.
 
-No new search task is created.
+The webhook itself does not wait for vision inference.
 
-## 11. Automatic notifications
+### High-confidence single book
 
-Telegram-linked tasks currently notify on these states:
+If one book is identified confidently, the bot automatically continues:
 
-- `needs_selection`
-- `needs_source`
-- `staged` when delivery is not configured
-- `delivered`
-- `delivery_unknown`
-- `failed`
+```text
+识别到《Pride and Prejudice》（Jane Austen），开始查找并发送到 Kindle。
+```
 
-A `last_notified_status` field prevents the same terminal/waiting state from repeatedly generating identical notifications during queue retries.
+### Low-confidence or multi-book image
+
+The recognition result is stored temporarily in D1 and Telegram sends inline buttons. The user selects the desired book before a book task is created.
+
+Image-choice records expire after 24 hours and are removed after selection/cancellation.
+
+### Image caption preferences
+
+A caption may contain preferences such as:
+
+```text
+PDF
+```
+
+```text
+英文 EPUB
+```
+
+These preferences are preserved even when recognition pauses for a selection button.
+
+The default format remains EPUB.
+
+## 9. Source-edition ambiguity
+
+Image recognition ambiguity and ebook-source ambiguity are separate stages.
+
+After a book title is known, the existing workflow may still reach `needs_selection` if multiple source editions are similarly ranked. Telegram then presents the normal source-candidate buttons and resumes the same task after selection.
+
+## 10. Automatic notifications
+
+Telegram-linked book tasks notify on:
+
+- `needs_selection`;
+- `needs_source`;
+- `staged` when delivery is unavailable;
+- `delivered`;
+- `delivery_unknown`;
+- `failed`.
+
+A failed Telegram notification does not turn a confirmed Kindle delivery into a failed task.
+
+## 11. Vision retry policy
+
+Vision jobs are intentionally **not automatically retried** by the Queue consumer.
+
+Reason: a retry can spend the free AI allocation again and may create duplicate recognition buttons/tasks. If vision fails, the user receives a failure message and can resend the image.
+
+Normal book tasks retain their existing retry behavior before delivery begins.
 
 ## 12. Security decisions
 
-- Telegram webhook calls do **not** use the normal API bearer token.
-- The webhook is authenticated using Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
-- Task creation requires `TELEGRAM_ALLOWED_USER_IDS`.
-- Only private chats are accepted.
-- Inline candidate selections are tied to both the original Telegram user and chat.
-- Bot token, webhook secret and user allowlist belong in Wrangler secrets / `.dev.vars`, not Git.
-- Telegram is only an entry/notification adapter; the core book workflow remains provider-neutral.
+- webhook calls are authenticated with `X-Telegram-Bot-Api-Secret-Token`;
+- task/image use requires `TELEGRAM_ALLOWED_USER_IDS`;
+- only private chats are accepted;
+- image candidate callbacks are bound to the original user and chat;
+- source candidate callbacks are also bound to the original user and chat;
+- Telegram file URLs are built internally and never accepted from user input;
+- image bytes are size-limited and signature-checked;
+- Bot/Gmail secrets are never stored in D1;
+- recognition results are temporary metadata only;
+- the image itself is not persisted to R2 by the vision entry layer.
 
 ## 13. Local development
 
-Add to `.dev.vars`:
+Add Telegram values to `.dev.vars`:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=...
@@ -257,6 +261,16 @@ TELEGRAM_WEBHOOK_SECRET=...
 TELEGRAM_ALLOWED_USER_IDS=123456789
 ```
 
-Telegram requires a public HTTPS webhook URL, so a plain `localhost` Wrangler server cannot receive Telegram webhooks directly. For local Telegram testing, use a secure HTTPS tunnel or deploy a temporary Worker environment.
+Workers AI is provided by the `AI` binding. Telegram requires a public HTTPS webhook, so plain `localhost` cannot receive live Telegram updates directly. Use a secure tunnel or a temporary Cloudflare deployment for live bot testing.
 
-The non-Telegram API remains fully testable locally without a tunnel.
+## 14. Image acceptance test
+
+After deployment, test at least these cases:
+
+1. one clear cover -> automatic title recognition -> normal Kindle workflow;
+2. screenshot with multiple books -> inline book-selection buttons;
+3. blurry/non-book image -> no task created;
+4. oversized image -> rejected before Workers AI;
+5. unauthorized user image -> no vision inference;
+6. image with caption `PDF` -> selected/recognized task preserves PDF preference;
+7. final `delivered` state -> Telegram completion message.
