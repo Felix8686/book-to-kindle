@@ -13,6 +13,34 @@ The project follows Semantic Versioning while it is practical to do so.
 - explicit user-controlled retry for uncertain deliveries
 - additional authorized/public-domain source adapters
 
+## [0.4.0] - 2026-08-29
+
+### Added
+- Telegram photo/image-document input for book requests
+- asynchronous Telegram image recognition through the existing Cloudflare Queue
+- Cloudflare Workers AI binding for `@cf/meta/llama-3.2-11b-vision-instruct`
+- structured vision extraction of book title, author, apparent language and confidence
+- automatic continuation for a high-confidence single-book image
+- inline Telegram selection buttons for low-confidence or multi-book images
+- temporary D1 `telegram_image_choices` records with 24-hour expiry
+- JPEG/PNG/WebP image signature validation
+- configurable `MAX_TELEGRAM_IMAGE_BYTES` guardrail (4 MiB default, 6 MiB hard cap)
+- image-caption preferences such as PDF/中文/英文 carried into the normal book task
+- `vision: workers_ai` status in `/health`
+
+### Architecture / reliability
+- vision inference runs in Queue consumers instead of blocking the Telegram webhook
+- image bytes are downloaded only for authorized Telegram users
+- vision jobs are not automatically retried, preventing duplicate AI cost/buttons/tasks
+- the vision entry layer does not persist source images in R2 or D1
+- image ambiguity is resolved before creating the normal book task; source-edition ambiguity remains a separate later step
+- Telegram image choice callbacks are bound to the original user and chat
+
+### Documentation
+- documented the one-time Meta model license/AUP prerequisite
+- documented Workers AI Free daily allocation and image-size guardrails
+- added image acceptance tests to Telegram/deployment guidance
+
 ## [0.3.0] - 2026-08-29
 
 ### Added
