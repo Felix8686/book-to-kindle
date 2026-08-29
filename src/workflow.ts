@@ -127,6 +127,19 @@ async function validatedBookStream(
   });
 }
 
+async function isCancelled(repo: TaskRepository, taskId: string): Promise<boolean> {
+  const latest = await repo.get(taskId);
+  return Boolean(latest && String(latest.status) === "cancelled");
+}
+
+async function cleanupCancelledObject(env: Env, storageKey: string): Promise<void> {
+  try {
+    await env.FILES.delete(storageKey);
+  } catch (error) {
+    console.warn("Cancelled task R2 cleanup failed", storageKey, error);
+  }
+}
+
 export interface WorkflowDependencies {
   env: Env;
   sources: SourceAdapter[];
@@ -138,6 +151,7 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
   const task = await repo.get(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
 
+  if (String(task.status) === "cancelled") return;
   if (task.status === "delivered" || task.status === "delivery_unknown") return;
   if (task.status === "delivering") {
     await repo.update(taskId, {
@@ -150,12 +164,14 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
   if (task.status === "needs_selection" && !task.selectedCandidate) return;
 
   let deliveryStarted = false;
+  let activeStorageKey: string | undefined;
 
   try {
     let selected = task.selectedCandidate;
 
     if (!selected) {
       await repo.update(taskId, { status: "searching", errorMessage: null });
+      if (await isCancelled(repo, taskId)) return;
 
       if (deps.sources.length === 0) {
         await repo.update(taskId, {
@@ -175,6 +191,8 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
           }
         }),
       );
+
+      if (await isCancelled(repo, taskId)) return;
 
       const ranked = rankedCandidates(resultSets.flat(), task).slice(0, 10);
       selected = autoSelect(ranked) ?? undefined;
@@ -203,9 +221,19 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
       deliveryReceipt: null,
       errorMessage: null,
     });
+    if (await isCancelled(repo, taskId)) return;
 
     const cloudLimit = maxCloudFileBytes(deps.env);
     const download = await source.download(selected, { maxBytes: cloudLimit });
+
+    if (await isCancelled(repo, taskId)) {
+      try {
+        await download.body.cancel("Task cancelled by user");
+      } catch {
+        // Best effort only; the task is already terminally cancelled.
+      }
+      return;
+    }
 
     if (download.sizeBytes && download.sizeBytes > cloudLimit) {
       throw new Error("File is too large for the Cloudflare delivery path; use a local enhancement node.");
@@ -214,6 +242,7 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
     const validatedBody = await validatedBookStream(download.body, selected.format.toLowerCase());
     const extension = selected.format.toLowerCase();
     const storageKey = `tasks/${taskId}/${crypto.randomUUID()}.${extension}`;
+    activeStorageKey = storageKey;
     const storageOptions = {
       httpMetadata: { contentType: download.contentType },
       customMetadata: {
@@ -235,7 +264,19 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
       const bufferedBody = await new Response(validatedBody).arrayBuffer();
       await deps.env.FILES.put(storageKey, bufferedBody, storageOptions);
     }
+
+    if (await isCancelled(repo, taskId)) {
+      await cleanupCancelledObject(deps.env, storageKey);
+      activeStorageKey = undefined;
+      return;
+    }
+
     await repo.update(taskId, { status: "staged", storageKey });
+    if (await isCancelled(repo, taskId)) {
+      await cleanupCancelledObject(deps.env, storageKey);
+      activeStorageKey = undefined;
+      return;
+    }
 
     if (!deps.delivery || !deps.env.KINDLE_EMAIL) {
       await repo.update(taskId, {
@@ -248,7 +289,16 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
     const object = await deps.env.FILES.get(storageKey);
     if (!object) throw new Error("Staged file disappeared from R2.");
 
+    // Cancellation and the transition into delivery race on the same D1 status.
+    // TaskRepository.update cannot overwrite 'cancelled', so whichever state wins
+    // is authoritative. Gmail is invoked only after we re-read that decision.
     await repo.update(taskId, { status: "delivering", errorMessage: null });
+    if (await isCancelled(repo, taskId)) {
+      await cleanupCancelledObject(deps.env, storageKey);
+      activeStorageKey = undefined;
+      return;
+    }
+
     deliveryStarted = true;
 
     const receipt = await deps.delivery.deliver({
@@ -266,10 +316,16 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
 
     try {
       await deps.env.FILES.delete(storageKey);
+      activeStorageKey = undefined;
     } catch (cleanupError) {
       console.warn("Delivered task R2 cleanup failed", taskId, cleanupError);
     }
   } catch (error) {
+    if (await isCancelled(repo, taskId)) {
+      if (activeStorageKey) await cleanupCancelledObject(deps.env, activeStorageKey);
+      return;
+    }
+
     const message = error instanceof Error ? error.message : "Unknown workflow failure";
 
     if (deliveryStarted) {
