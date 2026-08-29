@@ -12,8 +12,8 @@
     "db:migrate:remote": "wrangler d1 migrations apply book-to-kindle --remote"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260829.0",
-    "typescript": "^5.9.2",
-    "wrangler": "^4.33.1"
+    "@cloudflare/workers-types": "5.20260827.1",
+    "typescript": "5.9.2",
+    "wrangler": "4.127.0"
   }
 }
