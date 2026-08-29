@@ -73,6 +73,10 @@ export class TaskRepository {
     const current = await this.get(id);
     if (!current) throw new Error(`Task not found: ${id}`);
 
+    // A user cancellation is a terminal control-plane decision. Queue work that
+    // was already in flight must never be able to overwrite it with a later state.
+    if (String(current.status) === "cancelled") return;
+
     const status = patch.status ?? current.status;
     const candidates =
       patch.candidates === undefined ? current.candidates : patch.candidates ?? undefined;
@@ -99,7 +103,7 @@ export class TaskRepository {
              delivery_receipt_json = ?6,
              error_message = ?7,
              updated_at = ?8
-         WHERE id = ?1`,
+         WHERE id = ?1 AND status <> 'cancelled'`,
       )
       .bind(
         id,
