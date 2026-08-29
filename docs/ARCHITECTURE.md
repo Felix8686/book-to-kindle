@@ -4,7 +4,7 @@
 
 Book to Kindle turns a short intent such as “send this book to my Kindle” into an asynchronous delivery task.
 
-The core workflow must remain usable in two modes:
+The core workflow remains usable in two modes:
 
 - **Cloud mode:** always-on Cloudflare deployment, available while the user's PC is off.
 - **Local mode:** the same Worker code executed locally with Wrangler, with optional access to heavyweight local tools.
@@ -20,6 +20,7 @@ The project must not require a VPS.
 5. Heavy conversion/repair is an optional enhancement, not a prerequisite for basic delivery.
 6. A low-confidence search result must require selection rather than silently sending the first match.
 7. Providers and delivery mechanisms must be adapters so they can be replaced without rewriting orchestration.
+8. Bundled source adapters must target public-domain, user-owned, or otherwise authorized content.
 
 ## 3. Runtime topology
 
@@ -44,10 +45,10 @@ Other clients -------->|                       |
                          search/download |
                               |         |
                               v         v
-                       Source adapters  R2 staging
-                                         |
+                    Gutendex adapter   R2 staging
+                    Project Gutenberg     |
                                          v
-                                  Delivery adapter
+                                  Gmail delivery
                                          |
                                          v
                                        Kindle
@@ -55,17 +56,17 @@ Other clients -------->|                       |
 
 ## 4. Why a queue
 
-The HTTP handler only validates, persists and enqueues. This protects the Free-plan request CPU budget and makes retries explicit.
+The HTTP handler only validates, persists and enqueues. This protects the request-path CPU budget and makes retries explicit.
 
 Queue jobs can:
 
-- call multiple source adapters;
+- call one or more source adapters;
 - rank candidates;
 - pause in `needs_selection`;
 - download a compatible file;
-- stage it in R2;
+- validate and stage it in R2;
 - invoke delivery;
-- retry transient failures.
+- retry upstream failures.
 
 The queue message contains only a task ID. It never contains ebook bytes.
 
@@ -81,7 +82,10 @@ searching
   v                   v
 needs_source      needs_selection
                        |
-                       | user/agent selection (future)
+                       | POST /select
+                       v
+                     queued
+                       |
                        v
                    downloading
                        |
@@ -96,34 +100,64 @@ needs_source      needs_selection
          delivered             failed
 ```
 
-`needs_source` and `needs_selection` are intentional non-error states. They allow the workflow to ask for help only when automation is not confident enough.
+`needs_source` and `needs_selection` are intentional non-error states. Candidate lists are persisted in D1 so a chat client can ask the user which edition to use and resume the same task afterwards.
 
 ## 6. Candidate ranking
 
-The first implementation uses deterministic scoring instead of an LLM:
+The current implementation uses deterministic scoring instead of an LLM:
 
 - exact/near title match;
 - author match;
 - language match;
 - preferred format match;
-- file-size penalty for files too large for the cloud path.
+- file-size penalty for files too large for the normal cloud path.
 
 If the best candidate has a weak score or is too close to the runner-up, the task becomes `needs_selection`.
 
-An AI model can be added later as a secondary ranking signal, but it should not be required for the basic workflow.
+An AI model may later be added as a secondary metadata/ranking signal, but it must not be required for the basic workflow.
 
-## 7. Cloudflare Free budget
+## 7. Built-in source adapter
+
+v0.2 ships with a Gutendex adapter over Project Gutenberg metadata.
+
+Safety and scope rules:
+
+- request `copyright=false` entries;
+- return only EPUB/PDF candidates;
+- restrict actual downloads to HTTPS hosts under `gutenberg.org`;
+- stream downloads through a byte limit;
+- validate EPUB ZIP or PDF signatures before R2 staging.
+
+This adapter is intentionally useful for end-to-end testing without making an unauthorized-content provider part of the default project.
+
+## 8. Delivery adapter
+
+The first production delivery adapter is Gmail API -> Send to Kindle email.
+
+It uses:
+
+- OAuth refresh token stored as a secret;
+- `gmail.send` scope;
+- Gmail `users.messages.send` media-upload URI;
+- RFC 822 multipart MIME;
+- streaming from R2 into the outbound message.
+
+The default cloud file threshold is **20 MiB**, capped in code below 24 MiB. This is an engineering guardrail, not an Amazon maximum.
+
+To reduce duplicate documents, a task found in `delivering` after an unknown previous outcome is not automatically resent. It is moved to `failed` for explicit inspection.
+
+## 9. Cloudflare resource model
 
 Design target as of 2026-08-29:
 
-- Worker request path: very small CPU budget, so request handling stays minimal.
-- Queue: asynchronous work and retry boundary.
-- R2: temporary file staging; objects should be deleted after successful delivery.
-- D1: task metadata only.
+- HTTP Worker path: very small CPU use; validate, persist, enqueue.
+- Queue consumer: network-heavy search/download/delivery work.
+- R2: temporary ebook staging and streaming source for delivery.
+- D1: task metadata and candidate lists only.
 
-The code intentionally sets a conservative cloud-path file threshold (currently 24 MiB). This is not a claim about Kindle's absolute limit; it is an engineering guardrail to leave room for delivery encoding and Cloudflare memory/CPU constraints.
+The workflow avoids full-file buffering in JavaScript memory on the cloud path.
 
-## 8. Local mode
+## 10. Local mode
 
 Local mode is not a fork of the backend.
 
@@ -131,29 +165,28 @@ Local mode is not a fork of the backend.
 npm run dev
 ```
 
-Wrangler provides local Worker/D1/R2/Queue emulation. This lets the same code run without a Cloudflare deployment.
+Wrangler provides local Worker/D1/R2/Queue emulation, allowing the same API and state machine to run without deployment.
 
-Future local enhancement adapters may expose:
-
-- Shelfmark search/download;
-- Calibre conversion/repair;
-- Calibre-Web Automated ingest;
-- other filesystem-based tools.
-
-These adapters should communicate with the core through HTTP or queue/pull contracts rather than importing platform-specific code into the core Worker.
-
-## 9. Local enhancement node
+## 11. Optional local enhancement node
 
 The optional enhancement node exists for tasks Cloudflare should not do, such as:
 
 - converting unsupported formats;
 - repairing malformed EPUBs;
 - processing large files;
-- using tools that require native binaries or Docker.
+- running native binaries or Docker services.
 
-Cloud mode remains useful without this node: compatible EPUB/PDF files can follow the lightweight path directly.
+Future components may include:
 
-## 10. Adapter boundaries
+- Shelfmark search/download;
+- Calibre conversion/repair;
+- Calibre-Web Automated ingest.
+
+These tools should communicate with the core through a narrow HTTP or queue/pull contract rather than being imported into Worker code.
+
+Cloud mode remains useful without this node: compatible lightweight EPUB/PDF files can follow the direct path.
+
+## 12. Adapter boundaries
 
 ### Source adapter
 
@@ -161,11 +194,12 @@ Cloud mode remains useful without this node: compatible EPUB/PDF files can follo
 interface SourceAdapter {
   name: string;
   search(request: BookRequest): Promise<BookCandidate[]>;
-  download(candidate: BookCandidate): Promise<DownloadResult>;
+  download(
+    candidate: BookCandidate,
+    options?: { maxBytes?: number }
+  ): Promise<DownloadResult>;
 }
 ```
-
-Bundled source adapters should be for public-domain, user-owned, or otherwise authorized content. Other integrations remain separate deployments/configurations.
 
 ### Delivery adapter
 
@@ -176,22 +210,21 @@ interface DeliveryAdapter {
 }
 ```
 
-The first planned production adapter is Gmail API -> Send to Kindle email.
-
-## 11. Security model
+## 13. Security model
 
 - bearer token required for task APIs;
 - secrets stored as Wrangler secrets or local `.dev.vars`;
 - no credentials in D1 or Git;
-- source adapters should enforce destination/domain allowlists;
-- validate content type, format signature and size before staging;
+- source adapters enforce explicit destination/domain allowlists;
+- validate content type, file signature and size before staging;
 - use opaque R2 keys rather than user-controlled paths;
 - delete temporary objects after successful delivery;
-- log task IDs/status, not ebook contents or secrets.
+- log task IDs/status, not ebook contents or secrets;
+- block blind automatic resend after an uncertain Gmail delivery outcome.
 
-## 12. Future entry points
+## 14. Future entry points
 
-Entry points should all reduce to the same `BookRequest`:
+All entry points reduce to the same `BookRequest`:
 
 ```json
 {
