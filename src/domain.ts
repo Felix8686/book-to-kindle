@@ -6,6 +6,7 @@ export type TaskStatus =
   | "downloading"
   | "staged"
   | "delivering"
+  | "delivery_unknown"
   | "delivered"
   | "failed";
 
@@ -28,6 +29,13 @@ export interface BookCandidate {
   score?: number;
 }
 
+export interface DeliveryReceipt {
+  provider: string;
+  acceptedAt: string;
+  messageId?: string;
+  threadId?: string;
+}
+
 export interface TaskRecord {
   id: string;
   status: TaskStatus;
@@ -35,6 +43,7 @@ export interface TaskRecord {
   candidates?: BookCandidate[];
   selectedCandidate?: BookCandidate;
   storageKey?: string;
+  deliveryReceipt?: DeliveryReceipt;
   errorMessage?: string;
   createdAt: string;
   updatedAt: string;
@@ -63,7 +72,7 @@ export interface DeliveryAdapter {
     task: TaskRecord;
     object: R2ObjectBody;
     kindleEmail: string;
-  }): Promise<void>;
+  }): Promise<DeliveryReceipt>;
 }
 
 export interface Env {
