@@ -8,7 +8,8 @@ export type TaskStatus =
   | "delivering"
   | "delivery_unknown"
   | "delivered"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export interface BookRequest {
   query: string;
@@ -142,4 +143,11 @@ export interface Env {
   ZLIBRARY_REMIX_USERID?: string;
   ZLIBRARY_REMIX_USERKEY?: string;
   ZLIBRARY_DOMAIN?: string;
+  // Free Tier Guard
+  FREE_TIER_GUARD_ENABLED?: string;
+  MAX_MONTHLY_TASKS?: string;
+  MAX_MONTHLY_AI_IMAGES?: string;
+  MAX_MONTHLY_SOURCE_REQUESTS?: string;
+  MAX_MONTHLY_R2_PUTS?: string;
+  MAX_MONTHLY_DELIVERIES?: string;
 }

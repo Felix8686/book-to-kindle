@@ -511,6 +511,8 @@ function taskStatusText(task: TaskRecord): string {
       return `没有找到《${task.request.query}》的可用来源。`;
     case "delivered":
       return `《${title}》已发送到 Kindle。`;
+    case "cancelled":
+      return `《${title}》已被取消。`;
     case "delivery_unknown":
       return [
         `《${title}》的 Gmail 投递结果无法确认。`,

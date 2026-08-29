@@ -124,13 +124,15 @@ Current migration sequence:
 0005_telegram_update_idempotency.sql
 0006_telegram_image_choices.sql
 0007_user_settings.sql
+0008_usage_counters.sql
 ```
 
 Important roles:
 
 - `0005` prevents Telegram update replay from creating duplicate work;
 - `0006` stores temporary image-recognition choices only;
-- `0007` stores persistent user book settings (`zh` + EPUB defaults).
+- `0007` stores persistent user book settings (`zh` + EPUB defaults);
+- `0008` stores monthly application usage counters for Free Tier Guard.
 
 The original image itself is not persisted in D1. Task cancellation uses the existing free-form `tasks.status` value and needs no additional migration.
 
@@ -141,6 +143,7 @@ The original image itself is not persisted in D1. Task cancellation uses the exi
 ```bash
 npm install
 npm run typecheck
+npm test
 npm run deploy
 ```
 
@@ -150,14 +153,16 @@ Health check:
 curl https://<your-worker>.workers.dev/health
 ```
 
-A v0.5.1 deployment should report the active resolver/source inventory, for example:
+A deployment should report the active resolver/source inventory, for example:
 
 ```json
 {
   "resolvers": ["openlibrary", "google-books"],
-  "sources": ["gutendex", "google-books-free", "internet-archive-public"],
+  "sources": ["gutendex", "google-books-free", "internet-archive-public", "zlibrary"],
+  "zlibrary": "configured",
   "defaultLanguage": "zh",
-  "vision": "workers_ai"
+  "vision": "workers_ai",
+  "freeTierGuard": "enabled"
 }
 ```
 

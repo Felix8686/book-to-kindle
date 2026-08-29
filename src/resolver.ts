@@ -61,6 +61,38 @@ function normalizeGoogleLanguage(value?: string): string | undefined {
   return normalizeBookLanguage(value) ?? value.toLowerCase().slice(0, 2);
 }
 
+function normalizeText(text?: string): string {
+  if (!text) return "";
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isSameOrCompatibleAuthor(docAuthors: string[] | undefined, targetAuthors: string[]): boolean {
+  if (!targetAuthors.length || !docAuthors?.length) return true;
+  const normalizedTargets = targetAuthors.map(normalizeText).filter(Boolean);
+  const normalizedDocs = docAuthors.map(normalizeText).filter(Boolean);
+  if (!normalizedTargets.length || !normalizedDocs.length) return true;
+
+  for (const t of normalizedTargets) {
+    for (const d of normalizedDocs) {
+      if (t.includes(d) || d.includes(t)) return true;
+    }
+  }
+  return false;
+}
+
+function isTitleCompatible(docTitle?: string, queryTitle?: string): boolean {
+  if (!docTitle || !queryTitle) return false;
+  const d = normalizeText(docTitle);
+  const q = normalizeText(queryTitle);
+  if (!d || !q) return false;
+  if (d === q || d.includes(q) || q.includes(d)) return true;
+  return false;
+}
+
 function addTitle(
   output: BookTitleVariant[],
   seen: Set<string>,
@@ -93,7 +125,7 @@ async function fetchJson<T>(url: string): Promise<T> {
   const response = await fetch(url, {
     headers: {
       accept: "application/json",
-      "user-agent": "book-to-kindle/0.5 (+https://github.com/Felix8686/book-to-kindle)",
+      "user-agent": "book-to-kindle/0.6 (+https://github.com/Felix8686/book-to-kindle)",
     },
     signal: AbortSignal.timeout(5000),
   });
@@ -113,54 +145,67 @@ async function resolveOpenLibrary(
   const search = new URL("https://openlibrary.org/search.json");
   search.searchParams.set("q", [request.query, request.author].filter(Boolean).join(" "));
   search.searchParams.set("lang", preferredLanguage);
-  search.searchParams.set("limit", "5");
+  search.searchParams.set("limit", "10");
   search.searchParams.set("fields", "key,title,author_name,isbn");
 
   const data = await fetchJson<OpenLibrarySearchResponse>(search.toString());
   const docs = data.docs ?? [];
-  const first = docs[0];
+  const reqAuthors = request.author ? [request.author] : [];
+
+  // Canonical Work selection: choose the single most trustworthy match
+  let canonicalDoc: OpenLibrarySearchDoc | undefined;
+  for (const doc of docs) {
+    if (!doc.title) continue;
+    if (isTitleCompatible(doc.title, request.query) && isSameOrCompatibleAuthor(doc.author_name, reqAuthors)) {
+      canonicalDoc = doc;
+      break;
+    }
+  }
+
+  // Fallback to first doc if none strictly matched
+  if (!canonicalDoc && docs.length > 0) {
+    canonicalDoc = docs[0];
+  }
+
   const titles: BookTitleVariant[] = [];
   const seen = new Set<string>();
   const identifiers: BookIdentifiers = {};
   const authors: string[] = [];
 
-  for (const doc of docs.slice(0, 3)) {
-    addTitle(titles, seen, doc.title, undefined, "openlibrary");
-    authors.push(...(doc.author_name ?? []));
-    if (doc.key) {
-      identifiers.openLibraryWorkKeys = unique([
-        ...(identifiers.openLibraryWorkKeys ?? []),
-        doc.key,
-      ]);
+  if (canonicalDoc) {
+    addTitle(titles, seen, canonicalDoc.title, undefined, "openlibrary");
+    authors.push(...(canonicalDoc.author_name ?? []));
+    if (canonicalDoc.key) {
+      identifiers.openLibraryWorkKeys = unique([canonicalDoc.key]);
     }
-    for (const isbn of doc.isbn ?? []) {
+    for (const isbn of canonicalDoc.isbn ?? []) {
       const clean = isbn.replace(/[^0-9X]/gi, "");
       if (clean.length === 10) identifiers.isbn10 = unique([...(identifiers.isbn10 ?? []), clean]);
       if (clean.length === 13) identifiers.isbn13 = unique([...(identifiers.isbn13 ?? []), clean]);
     }
-  }
 
-  if (first?.key?.startsWith("/works/")) {
-    try {
-      const editionsUrl = new URL(`https://openlibrary.org${first.key}/editions.json`);
-      editionsUrl.searchParams.set("limit", "50");
-      const editions = await fetchJson<OpenLibraryEditionsResponse>(editionsUrl.toString());
-      const preferred: OpenLibraryEdition[] = [];
-      const others: OpenLibraryEdition[] = [];
+    if (canonicalDoc.key?.startsWith("/works/")) {
+      try {
+        const editionsUrl = new URL(`https://openlibrary.org${canonicalDoc.key}/editions.json`);
+        editionsUrl.searchParams.set("limit", "50");
+        const editions = await fetchJson<OpenLibraryEditionsResponse>(editionsUrl.toString());
+        const preferred: OpenLibraryEdition[] = [];
+        const others: OpenLibraryEdition[] = [];
 
-      for (const edition of editions.entries ?? []) {
-        const language = normalizeOlLanguage(edition.languages?.[0]?.key);
-        (language === preferredLanguage ? preferred : others).push(edition);
+        for (const edition of editions.entries ?? []) {
+          const language = normalizeOlLanguage(edition.languages?.[0]?.key);
+          (language === preferredLanguage ? preferred : others).push(edition);
+        }
+
+        for (const edition of [...preferred.slice(0, 10), ...others.slice(0, 15)]) {
+          const language = normalizeOlLanguage(edition.languages?.[0]?.key);
+          addTitle(titles, seen, edition.title, language, "openlibrary");
+          identifiers.isbn10 = unique([...(identifiers.isbn10 ?? []), ...(edition.isbn_10 ?? [])]);
+          identifiers.isbn13 = unique([...(identifiers.isbn13 ?? []), ...(edition.isbn_13 ?? [])]);
+        }
+      } catch (error) {
+        console.warn("Open Library editions lookup failed", error);
       }
-
-      for (const edition of [...preferred.slice(0, 8), ...others.slice(0, 12)]) {
-        const language = normalizeOlLanguage(edition.languages?.[0]?.key);
-        addTitle(titles, seen, edition.title, language, "openlibrary");
-        identifiers.isbn10 = unique([...(identifiers.isbn10 ?? []), ...(edition.isbn_10 ?? [])]);
-        identifiers.isbn13 = unique([...(identifiers.isbn13 ?? []), ...(edition.isbn_13 ?? [])]);
-      }
-    } catch (error) {
-      console.warn("Open Library editions lookup failed", error);
     }
   }
 
@@ -168,13 +213,14 @@ async function resolveOpenLibrary(
     titles,
     authors: unique(authors),
     identifiers,
-    canonicalTitle: first?.title,
+    canonicalTitle: canonicalDoc?.title,
   };
 }
 
 async function resolveGoogleBooks(
   request: BookRequest,
   preferredLanguage: string,
+  canonicalAuthor?: string,
 ): Promise<{
   titles: BookTitleVariant[];
   authors: string[];
@@ -199,14 +245,24 @@ async function resolveGoogleBooks(
   const volumes = settled.flatMap((result) =>
     result.status === "fulfilled" ? result.value.items ?? [] : [],
   );
+  const targetAuthors = [request.author, canonicalAuthor].filter((a): a is string => Boolean(a));
+
   const titles: BookTitleVariant[] = [];
   const seen = new Set<string>();
   const authors: string[] = [];
   const identifiers: BookIdentifiers = {};
+  let canonicalTitle: string | undefined;
 
-  for (const volume of volumes.slice(0, 16)) {
+  for (const volume of volumes) {
     const info = volume.volumeInfo;
     if (!info?.title) continue;
+
+    // Filter out unrelated volumes: ensure author and title match canonical work
+    if (!isTitleCompatible(info.title, request.query)) continue;
+    if (targetAuthors.length && !isSameOrCompatibleAuthor(info.authors, targetAuthors)) continue;
+
+    if (!canonicalTitle) canonicalTitle = info.title;
+
     addTitle(titles, seen, info.title, normalizeGoogleLanguage(info.language), "google-books");
     authors.push(...(info.authors ?? []));
     if (volume.id) {
@@ -224,7 +280,7 @@ async function resolveGoogleBooks(
     titles,
     authors: unique(authors),
     identifiers,
-    canonicalTitle: volumes[0]?.volumeInfo?.title,
+    canonicalTitle,
   };
 }
 
@@ -253,10 +309,22 @@ export async function resolveBookSearchContext(
     source: "request",
   };
 
-  const [openLibrary, googleBooks] = await Promise.allSettled([
-    resolveOpenLibrary(request, preferredLanguage),
-    resolveGoogleBooks(request, preferredLanguage),
-  ]);
+  // 1. First resolve Open Library canonical work
+  let olResult: Awaited<ReturnType<typeof resolveOpenLibrary>> | undefined;
+  try {
+    olResult = await resolveOpenLibrary(request, preferredLanguage);
+  } catch (error) {
+    console.warn("Open Library resolver failed", error);
+  }
+
+  // 2. Resolve Google Books filtered by canonical author from OL or request
+  const canonicalAuthor = olResult?.authors[0] ?? request.author;
+  let gbResult: Awaited<ReturnType<typeof resolveGoogleBooks>> | undefined;
+  try {
+    gbResult = await resolveGoogleBooks(request, preferredLanguage, canonicalAuthor);
+  } catch (error) {
+    console.warn("Google Books resolver failed", error);
+  }
 
   const titles: BookTitleVariant[] = [requestTitle];
   const seen = new Set([`${request.query.toLowerCase()}|${requestTitle.language ?? ""}`]);
@@ -264,17 +332,14 @@ export async function resolveBookSearchContext(
   const identifiers: BookIdentifiers = {};
   let canonicalTitle = request.query;
 
-  for (const result of [openLibrary, googleBooks]) {
-    if (result.status !== "fulfilled") {
-      console.warn("Book resolver source failed", result.reason);
-      continue;
-    }
-    canonicalTitle = canonicalTitle === request.query && result.value.canonicalTitle
-      ? result.value.canonicalTitle
+  for (const result of [olResult, gbResult]) {
+    if (!result) continue;
+    canonicalTitle = canonicalTitle === request.query && result.canonicalTitle
+      ? result.canonicalTitle
       : canonicalTitle;
-    authors.push(...result.value.authors);
-    mergeIdentifiers(identifiers, result.value.identifiers);
-    for (const title of result.value.titles) {
+    authors.push(...result.authors);
+    mergeIdentifiers(identifiers, result.identifiers);
+    for (const title of result.titles) {
       addTitle(titles, seen, title.title, title.language, title.source);
     }
   }

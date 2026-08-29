@@ -95,7 +95,7 @@ export function candidateScore(
   return score;
 }
 
-function candidateDedupKey(candidate: BookCandidate): string {
+export function candidateDedupKey(candidate: BookCandidate): string {
   const isbn13 = candidate.identifiers?.isbn13?.[0]?.replace(/[^0-9X]/gi, "");
   const isbn10 = candidate.identifiers?.isbn10?.[0]?.replace(/[^0-9X]/gi, "");
   const language = normalizeLanguage(candidate.language) ?? "";

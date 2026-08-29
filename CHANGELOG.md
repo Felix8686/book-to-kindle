@@ -14,6 +14,23 @@ The project follows Semantic Versioning while it is practical to do so.
 - optional Amazon catalog resolver using supported API credentials
 - additional verified public/open-access source adapters
 
+## [0.6.1] - 2026-08-30
+
+### Added
+- Cloudflare Free Tier Guard with application usage counters in D1 (`0008_usage_counters.sql`)
+- canonical work identity model in Resolver preventing metadata contamination across similar titles/authors
+- automated unit test suite using Vitest covering Resolvers, cancellation state machine, Free Tier Guard, and candidate ranking/deduping
+- `cancelled` added directly to `TaskStatus` enum in domain types
+
+### Fixed
+- Open Library and Google Books resolver now strictly isolate canonical work editions from secondary search results
+- ZLibrary auth token handling scoped to prevent sending credentials to signed CDN download links
+- Task cancellation race condition hardening against delivery transitions and R2 orphaned object cleanup
+
+### Changed
+- test script added to CI workflow (`npm test`)
+- package version bumped to `0.6.1`
+
 ## [0.6.0] - 2026-08-30
 
 ### Added

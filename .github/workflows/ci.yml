@@ -20,5 +20,8 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Typecheck
+      - name: Run typecheck
         run: npm run typecheck
+
+      - name: Run automated tests
+        run: npm test

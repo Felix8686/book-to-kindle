@@ -5,6 +5,7 @@ import { GutendexSource } from "./adapters/gutendex";
 import { InternetArchivePublicSource } from "./adapters/internetarchive";
 import { ZLibrarySource, isZLibraryConfigured } from "./adapters/zlibrary";
 import { cancelTask, handleTelegramControlWebhook } from "./cancel";
+import { isFreeTierGuardEnabled, UsageGuard } from "./guard";
 import { TaskRepository } from "./repository";
 import { handleTelegramSettingsWebhook } from "./settings";
 import {
@@ -85,6 +86,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       resolvers: ["openlibrary", "google-books"],
       sources: ["gutendex", "google-books-free", "internet-archive-public", "zlibrary"],
       zlibrary: isZLibraryConfigured(env) ? "configured" : "not_configured",
+      freeTierGuard: isFreeTierGuardEnabled(env) ? "enabled" : "disabled",
       defaultLanguage: "zh",
       delivery: isGmailConfigured(env) && env.KINDLE_EMAIL ? "gmail" : "not_configured",
       telegram: isTelegramConfigured(env) ? "configured" : "not_configured",
@@ -95,8 +97,20 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (!isAuthorized(request, env)) return unauthorized();
 
   const repo = new TaskRepository(env.DB);
+  const guard = new UsageGuard(env.DB);
 
   if (request.method === "POST" && url.pathname === "/api/v1/tasks") {
+    const check = await guard.checkCanCreateTask(env);
+    if (!check.allowed) {
+      return json(
+        {
+          error: "free_tier_guard_limit_reached",
+          message: check.reason,
+        },
+        { status: 429 },
+      );
+    }
+
     const body = await readJson(request);
     const bookRequest = validateBookRequest(body);
     if (!bookRequest) {
@@ -111,6 +125,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
     const id = crypto.randomUUID();
     await repo.create(id, bookRequest);
+    await guard.increment("tasks_created");
     await env.TASK_QUEUE.send({ kind: "book", taskId: id });
 
     return json({ id, status: "queued" }, { status: 202 });
