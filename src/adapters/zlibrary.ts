@@ -8,6 +8,7 @@ interface ZLibraryBook {
   lang?: string;
   extension?: string;
   filesize?: number;
+  identifier?: string;
 }
 
 interface ZLibrarySearchResponse {
@@ -55,7 +56,20 @@ interface SourceRef {
   extension: string;
 }
 
-const DEFAULT_DOMAINS = ["https://1lib.fr", "https://singlelogin.me"];
+const DEFAULT_DOMAINS = ["https://z-library.biz", "https://1lib.fr", "https://singlelogin.me"];
+
+function authCookies(session: Session): string {
+  return `remix_userid=${session.userId}; remix_userkey=${session.userKey}`;
+}
+
+function authHeaders(session: Session): Record<string, string> {
+  return {
+    "user-agent": userAgent(),
+    "remix-userid": session.userId,
+    "remix-userkey": session.userKey,
+    cookie: authCookies(session),
+  };
+}
 
 export function isZLibraryConfigured(env: Env): boolean {
   return Boolean(
@@ -103,16 +117,48 @@ function isAllowedHost(hostname: string, allowlist: string[]): boolean {
 function pickDownloadUrl(link: string, session: Session): string | null {
   try {
     const url = new URL(link);
+    if (url.protocol !== "https:") return null;
+    // Prefer an account personal domain when the link uses the /dtoken/ route.
     const tokenMatch = url.pathname.match(/\/dtoken\/(.+)$/);
-    if (!tokenMatch) return null;
-    for (const domain of session.domains) {
-      const candidate = new URL(`https://${new URL(domain).hostname}/dtoken/${tokenMatch[1]}`);
-      if (isAllowedHost(candidate.hostname, session.domains)) return candidate.toString();
+    if (tokenMatch) {
+      for (const domain of session.domains) {
+        const candidate = new URL(`https://${new URL(domain).hostname}/dtoken/${tokenMatch[1]}`);
+        if (isAllowedHost(candidate.hostname, session.domains)) return candidate.toString();
+      }
+      return null;
     }
-    return isAllowedHost(url.hostname, session.domains) ? url.toString() : null;
+    // Modern eapi returns a direct signed CDN link. The link is trusted because
+    // it came from an authenticated eapi response; redirect safety is enforced
+    // in download() by requiring the final host to match the original.
+    return url.toString();
   } catch {
     return null;
   }
+}
+
+function isSameHost(a: string, b: string): boolean {
+  try {
+    return new URL(a).hostname.toLowerCase() === new URL(b).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function identifiersFromBook(book: ZLibraryBook): { isbn10?: string[]; isbn13?: string[] } | undefined {
+  const raw = book.identifier ?? "";
+  const parts = raw.split(",").map((value) => value.trim().replace(/[^0-9X]/gi, "")).filter(Boolean);
+  if (parts.length === 0) return undefined;
+  const isbn10: string[] = [];
+  const isbn13: string[] = [];
+  for (const part of parts) {
+    if (part.length === 10) isbn10.push(part);
+    if (part.length === 13) isbn13.push(part);
+  }
+  if (isbn10.length === 0 && isbn13.length === 0) return undefined;
+  return {
+    ...(isbn10.length ? { isbn10: [...new Set(isbn10)] } : {}),
+    ...(isbn13.length ? { isbn13: [...new Set(isbn13)] } : {}),
+  };
 }
 
 function limitedStream(body: ReadableStream<Uint8Array>, maxBytes?: number): ReadableStream<Uint8Array> {
@@ -177,16 +223,11 @@ export class ZLibrarySource implements SourceAdapter {
   private async sessionFromRemix(domain: string): Promise<Session> {
     const userId = this.env.ZLIBRARY_REMIX_USERID!.trim();
     const userKey = this.env.ZLIBRARY_REMIX_USERKEY!.trim();
-
-    const headers = {
-      "user-agent": userAgent(),
-      "remix-userid": userId,
-      "remix-userkey": userKey,
-    };
+    const session: Session = { userId, userKey, domains: [domain] };
 
     const { response, body } = await tryJsonFetch(
       `${domain}/eapi/user/profile`,
-      { headers },
+      { headers: authHeaders(session) },
       10000,
     );
 
@@ -195,12 +236,11 @@ export class ZLibrarySource implements SourceAdapter {
     }
     const parsed = body as ZLibraryProfileResponse;
     const user = parsed.user;
-    const domains = [domain];
     if (parsed.success && user) {
-      for (const item of user.personalDomains ?? []) domains.push(`https://${item}`);
+      for (const item of user.personalDomains ?? []) session.domains.push(`https://${item}`);
     }
 
-    return { userId, userKey, domains };
+    return session;
   }
 
   private async ensureSession(): Promise<Session> {
@@ -243,9 +283,7 @@ export class ZLibrarySource implements SourceAdapter {
                 method: "POST",
                 headers: {
                   "content-type": "application/json",
-                  "user-agent": userAgent(),
-                  "remix-userid": session.userId,
-                  "remix-userkey": session.userKey,
+                  ...authHeaders(session),
                 },
                 body: JSON.stringify({
                   message: query,
@@ -296,6 +334,7 @@ export class ZLibrarySource implements SourceAdapter {
           sizeBytes: typeof book.filesize === "number" && book.filesize > 0 ? book.filesize : undefined,
           source: this.name,
           sourceRef: JSON.stringify(ref),
+          identifiers: identifiersFromBook(book),
           editionKey: `zlibrary:${book.id}`,
           sourceQuality: 60,
         });
@@ -323,13 +362,7 @@ export class ZLibrarySource implements SourceAdapter {
       try {
         const { response, body } = await tryJsonFetch(
           `${domain}/eapi/book/${ref.bookId}/${ref.hash}/file`,
-          {
-            headers: {
-              "user-agent": userAgent(),
-              "remix-userid": session.userId,
-              "remix-userkey": session.userKey,
-            },
-          },
+          { headers: authHeaders(session) },
           12000,
         );
         if (!response.ok) {
@@ -354,20 +387,16 @@ export class ZLibrarySource implements SourceAdapter {
     }
 
     const response = await fetch(downloadUrl, {
-      headers: {
-        "user-agent": userAgent(),
-        "remix-userid": session.userId,
-        "remix-userkey": session.userKey,
-      },
+      headers: authHeaders(session),
       redirect: "follow",
     });
 
     if (!response.ok || !response.body) {
       throw new Error(`ZLibrary download failed with HTTP ${response.status}.`);
     }
-    if (!isAllowedHost(new URL(response.url || downloadUrl).hostname, session.domains)) {
+    if (!isSameHost(response.url || downloadUrl, downloadUrl)) {
       await response.body.cancel();
-      throw new Error("Rejected ZLibrary download redirect outside the allowed personal domains.");
+      throw new Error("Rejected ZLibrary download redirect to a different host.");
     }
 
     const contentLength = Number(response.headers.get("content-length"));
