@@ -32,6 +32,7 @@ export interface TaskRecord {
   id: string;
   status: TaskStatus;
   request: BookRequest;
+  candidates?: BookCandidate[];
   selectedCandidate?: BookCandidate;
   storageKey?: string;
   errorMessage?: string;
@@ -46,7 +47,10 @@ export interface TaskQueueMessage {
 export interface SourceAdapter {
   name: string;
   search(request: BookRequest): Promise<BookCandidate[]>;
-  download(candidate: BookCandidate): Promise<{
+  download(
+    candidate: BookCandidate,
+    options?: { maxBytes?: number },
+  ): Promise<{
     body: ReadableStream<Uint8Array>;
     contentType: string;
     sizeBytes?: number;
@@ -70,4 +74,9 @@ export interface Env {
   KINDLE_EMAIL?: string;
   APP_ENV?: string;
   TEMP_OBJECT_TTL_HOURS?: string;
+  MAX_CLOUD_FILE_BYTES?: string;
+  GMAIL_CLIENT_ID?: string;
+  GMAIL_CLIENT_SECRET?: string;
+  GMAIL_REFRESH_TOKEN?: string;
+  GMAIL_FROM_EMAIL?: string;
 }
