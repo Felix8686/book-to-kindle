@@ -1,8 +1,11 @@
 import type { BookRequest, Env, TaskQueueMessage } from "./domain";
 import { GmailDelivery, isGmailConfigured } from "./adapters/gmail";
+import { GoogleBooksFreeSource } from "./adapters/googlebooks";
 import { GutendexSource } from "./adapters/gutendex";
+import { InternetArchivePublicSource } from "./adapters/internetarchive";
 import { cancelTask, handleTelegramControlWebhook } from "./cancel";
 import { TaskRepository } from "./repository";
+import { handleTelegramSettingsWebhook } from "./settings";
 import {
   handleTelegramWebhook,
   isTelegramConfigured,
@@ -59,6 +62,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
   if (url.pathname === "/telegram/webhook") {
+    const settingsResponse = await handleTelegramSettingsWebhook(
+      request.clone() as unknown as Request,
+      env,
+    );
+    if (settingsResponse) return settingsResponse;
+
     const controlResponse = await handleTelegramControlWebhook(
       request.clone() as unknown as Request,
       env,
@@ -72,7 +81,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       ok: true,
       service: "book-to-kindle",
       environment: env.APP_ENV ?? "unknown",
-      source: "gutendex",
+      resolvers: ["openlibrary", "google-books"],
+      sources: ["gutendex", "google-books-free", "internet-archive-public"],
+      defaultLanguage: "zh",
       delivery: isGmailConfigured(env) && env.KINDLE_EMAIL ? "gmail" : "not_configured",
       telegram: isTelegramConfigured(env) ? "configured" : "not_configured",
       vision: env.AI ? "workers_ai" : "not_configured",
@@ -164,6 +175,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       selectedCandidate: selected,
       errorMessage: null,
     });
+    const latest = await repo.get(task.id);
+    if (latest?.status === "cancelled") {
+      return json({ error: "task_cancelled", id: task.id }, { status: 409 });
+    }
     await env.TASK_QUEUE.send({ kind: "book", taskId: task.id });
 
     return json({ id: task.id, status: "queued", selectedCandidate: selected }, { status: 202 });
@@ -173,7 +188,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 }
 
 function sources() {
-  return [new GutendexSource()];
+  return [
+    new GutendexSource(),
+    new GoogleBooksFreeSource(),
+    new InternetArchivePublicSource(),
+  ];
 }
 
 export default {
@@ -191,8 +210,6 @@ export default {
         } catch (error) {
           console.error("Telegram image queue job failed", message.body.sourceMessageId, error);
         }
-        // Vision jobs are intentionally not auto-retried: repeating AI inference can
-        // waste the free quota and create duplicate buttons/tasks. The user can resend.
         message.ack();
         continue;
       }
