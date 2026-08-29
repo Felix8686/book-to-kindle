@@ -1,0 +1,29 @@
+name = "book-to-kindle"
+main = "src/index.ts"
+compatibility_date = "2026-08-29"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "book-to-kindle"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "book-to-kindle-files"
+
+[[queues.producers]]
+binding = "TASK_QUEUE"
+queue = "book-to-kindle-tasks"
+
+[[queues.consumers]]
+queue = "book-to-kindle-tasks"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = "book-to-kindle-dlq"
+
+[vars]
+APP_ENV = "production"
+TEMP_OBJECT_TTL_HOURS = "24"
