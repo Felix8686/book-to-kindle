@@ -73,6 +73,8 @@ interface RecognizedBook {
   author?: string;
   language?: string;
   confidence: number;
+  requestLanguage?: string;
+  preferredFormat?: "epub" | "pdf";
 }
 
 interface TelegramImageChoiceRecord {
@@ -781,12 +783,11 @@ async function handleImageChoiceCallback(
     return;
   }
 
-  const caption = callback.message.caption;
   const request: BookRequest = {
     query: book.title,
-    author: book.author,
-    language: explicitLanguage(caption),
-    preferredFormat: explicitFormat(caption),
+    author: book.author || undefined,
+    language: book.requestLanguage,
+    preferredFormat: book.preferredFormat ?? "epub",
   };
 
   await choicesRepo.delete(choiceId);
@@ -875,8 +876,10 @@ function normalizeRecognition(value: unknown): RecognizedBook[] {
     const item = raw as Record<string, unknown>;
     const title = typeof item.title === "string" ? cleanTitle(item.title) : "";
     if (!title) continue;
-    const author = typeof item.author === "string" ? item.author.trim().slice(0, 200) : undefined;
-    const language = typeof item.language === "string" ? item.language.trim().slice(0, 32) : undefined;
+    const rawAuthor = typeof item.author === "string" ? item.author.trim().slice(0, 200) : "";
+    const author = rawAuthor || undefined;
+    const rawLanguage = typeof item.language === "string" ? item.language.trim().slice(0, 32) : "";
+    const language = rawLanguage || undefined;
     const confidenceValue = Number(item.confidence);
     const confidence = Number.isFinite(confidenceValue)
       ? Math.max(0, Math.min(1, confidenceValue))
@@ -905,7 +908,14 @@ async function recognizeBooksFromImage(
     caption ? `The user added this caption: ${caption}` : "The user added no caption.",
   ].join("\n");
 
-  const raw = await env.AI.run(VISION_MODEL, {
+  // Cloudflare's runtime supports JSON Mode for this vision model, while the
+  // generated Workers TypeScript declaration currently lags that documented field.
+  const runVision = env.AI.run as unknown as (
+    model: string,
+    inputs: Record<string, unknown>,
+  ) => Promise<unknown>;
+
+  const raw = await runVision(VISION_MODEL, {
     messages: [
       {
         role: "system",
@@ -942,7 +952,7 @@ async function recognizeBooksFromImage(
     },
   });
 
-  const response = (raw as unknown as { response?: unknown }).response;
+  const response = (raw as { response?: unknown }).response;
   if (typeof response === "string") {
     try {
       return normalizeRecognition(JSON.parse(response));
@@ -1035,11 +1045,18 @@ export async function processTelegramImageMessage(
       return;
     }
 
+    const requestLanguage = explicitLanguage(job.caption);
+    const preferredFormat = explicitFormat(job.caption);
+    const choices = books.map((book) => ({
+      ...book,
+      requestLanguage,
+      preferredFormat,
+    }));
     const record = await new TelegramImageChoiceRepository(env.DB).create({
       chatId: job.chatId,
       userId: job.userId,
       sourceMessageId: job.sourceMessageId,
-      choices: books,
+      choices,
     });
     await sendTelegramMessage(
       env,
