@@ -1,6 +1,7 @@
 import type { BookRequest, Env, TaskQueueMessage } from "./domain";
 import { GmailDelivery, isGmailConfigured } from "./adapters/gmail";
 import { GutendexSource } from "./adapters/gutendex";
+import { cancelTask, handleTelegramControlWebhook } from "./cancel";
 import { TaskRepository } from "./repository";
 import {
   handleTelegramWebhook,
@@ -58,6 +59,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
   if (url.pathname === "/telegram/webhook") {
+    const controlResponse = await handleTelegramControlWebhook(request.clone(), env);
+    if (controlResponse) return controlResponse;
     return handleTelegramWebhook(request, env);
   }
 
@@ -95,6 +98,39 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     await env.TASK_QUEUE.send({ kind: "book", taskId: id });
 
     return json({ id, status: "queued" }, { status: 202 });
+  }
+
+  const cancelMatch = url.pathname.match(/^\/api\/v1\/tasks\/([0-9a-f-]+)\/cancel$/i);
+  if (request.method === "POST" && cancelMatch) {
+    const result = await cancelTask(cancelMatch[1], env);
+    if (result.outcome === "not_found") {
+      return json({ error: "not_found" }, { status: 404 });
+    }
+    if (result.outcome === "too_late") {
+      return json(
+        {
+          error: "too_late_to_cancel",
+          id: result.taskId,
+          status: result.status,
+          message:
+            result.status === "delivered"
+              ? "Delivery has already completed and cannot be remotely withdrawn from Gmail/Kindle."
+              : "Gmail delivery has already started or its outcome is uncertain, so cancellation cannot be guaranteed.",
+        },
+        { status: 409 },
+      );
+    }
+    if (result.outcome === "not_cancellable") {
+      return json(
+        {
+          error: "task_not_cancellable",
+          id: result.taskId,
+          status: result.status,
+        },
+        { status: 409 },
+      );
+    }
+    return json({ id: result.taskId, status: "cancelled" });
   }
 
   const taskMatch = url.pathname.match(/^\/api\/v1\/tasks\/([0-9a-f-]+)$/i);
