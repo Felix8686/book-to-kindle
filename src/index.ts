@@ -176,7 +176,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       errorMessage: null,
     });
     const latest = await repo.get(task.id);
-    if (latest?.status === "cancelled") {
+    if (String(latest?.status) === "cancelled") {
       return json({ error: "task_cancelled", id: task.id }, { status: 409 });
     }
     await env.TASK_QUEUE.send({ kind: "book", taskId: task.id });
