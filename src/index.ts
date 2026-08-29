@@ -3,6 +3,7 @@ import { GmailDelivery, isGmailConfigured } from "./adapters/gmail";
 import { GoogleBooksFreeSource } from "./adapters/googlebooks";
 import { GutendexSource } from "./adapters/gutendex";
 import { InternetArchivePublicSource } from "./adapters/internetarchive";
+import { ZLibrarySource, isZLibraryConfigured } from "./adapters/zlibrary";
 import { cancelTask, handleTelegramControlWebhook } from "./cancel";
 import { TaskRepository } from "./repository";
 import { handleTelegramSettingsWebhook } from "./settings";
@@ -82,7 +83,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       service: "book-to-kindle",
       environment: env.APP_ENV ?? "unknown",
       resolvers: ["openlibrary", "google-books"],
-      sources: ["gutendex", "google-books-free", "internet-archive-public"],
+      sources: ["gutendex", "google-books-free", "internet-archive-public", "zlibrary"],
+      zlibrary: isZLibraryConfigured(env) ? "configured" : "not_configured",
       defaultLanguage: "zh",
       delivery: isGmailConfigured(env) && env.KINDLE_EMAIL ? "gmail" : "not_configured",
       telegram: isTelegramConfigured(env) ? "configured" : "not_configured",
@@ -187,11 +189,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   return json({ error: "not_found" }, { status: 404 });
 }
 
-function sources() {
+function sources(env: Env) {
   return [
     new GutendexSource(),
     new GoogleBooksFreeSource(),
     new InternetArchivePublicSource(),
+    ZLibrarySource.create(env),
   ];
 }
 
@@ -220,7 +223,7 @@ export default {
       try {
         await processTask(taskId, {
           env,
-          sources: sources(),
+          sources: sources(env),
           delivery,
         });
       } catch (error) {

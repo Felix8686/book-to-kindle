@@ -1,6 +1,6 @@
 # Book resolution and sources
 
-Book to Kindle v0.5 separates **book identity resolution** from **download sources**.
+Book to Kindle v0.6 separates **book identity resolution** from **download sources**.
 
 This is intentional: an English title, a Chinese translated title, an ISBN and a Kindle product listing may all refer to the same underlying work, while the downloadable file can come from a completely different provider.
 
@@ -75,7 +75,31 @@ Amazon can be useful as an optional future catalog resolver for commercial editi
 
 ## Download SourceAdapters
 
-Enabled in v0.5:
+Enabled in v0.6:
+
+### `zlibrary`
+
+Search metadata and files: ZLibrary, via the official JSON `/eapi/` interface (the HTML site is protected by browser challenges, but the JSON endpoints are usable from server-side clients).
+
+Requires an account. Configure either:
+
+```text
+ZLIBRARY_EMAIL + ZLIBRARY_PASSWORD
+```
+
+or the longer-lived session values (preferred for unattended workers):
+
+```text
+ZLIBRARY_REMIX_USERID + ZLIBRARY_REMIX_USERKEY
+```
+
+Optional:
+
+```text
+ZLIBRARY_DOMAIN   # override the default eapi base domain (default: https://1lib.fr, https://singlelogin.me)
+```
+
+The adapter logs in (or reuses the remix session), searches with the resolved title variants plus the requested author, keeps only EPUB/PDF results, and marks candidates with a high source quality. Downloads resolve the per-book file endpoint and are restricted to the account's personal download domains; credentials are never written into code, logs or Git.
 
 ### `gutendex`
 

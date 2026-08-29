@@ -14,6 +14,19 @@ The project follows Semantic Versioning while it is practical to do so.
 - optional Amazon catalog resolver using supported API credentials
 - additional verified public/open-access source adapters
 
+## [0.6.0] - 2026-08-30
+
+### Added
+- ZLibrary download source adapter (`zlibrary`) using the official JSON `/eapi/` interface
+- account session support via `ZLIBRARY_EMAIL`/`ZLIBRARY_PASSWORD` or `ZLIBRARY_REMIX_USERID`/`ZLIBRARY_REMIX_USERKEY`
+- personal download-domain allowlisting for ZLibrary file delivery
+- `zlibrary` configuration state reported in `/health`
+- source policy documented in `docs/SOURCES.md` and `docs/ARCHITECTURE.md`
+
+### Changed
+- product source policy updated from a public-domain-only stance to owner-selected sources; Project Gutenberg remains public-domain-limited, ZLibrary covers the broader library the owner actually reads
+- version bumped to `0.6.0`
+
 ## [0.5.1] - 2026-08-29
 
 ### Fixed

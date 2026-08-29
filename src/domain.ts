@@ -137,4 +137,9 @@ export interface Env {
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   TELEGRAM_ALLOWED_USER_IDS?: string;
+  ZLIBRARY_EMAIL?: string;
+  ZLIBRARY_PASSWORD?: string;
+  ZLIBRARY_REMIX_USERID?: string;
+  ZLIBRARY_REMIX_USERKEY?: string;
+  ZLIBRARY_DOMAIN?: string;
 }

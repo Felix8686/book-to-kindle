@@ -21,7 +21,7 @@ The project must not require a VPS.
 6. Heavy repair/conversion remains an optional local enhancement.
 7. Ambiguous recognition/search results require user selection rather than blind send.
 8. Entry, resolver, source and delivery mechanisms remain replaceable adapters/layers.
-9. Bundled download sources target public-domain or explicitly public/free downloadable content.
+9. Bundled download sources are chosen by the project owner for personal use. Project Gutenberg stays limited to public-domain records; the ZLibrary source (account-credentialed) serves the broader library the owner actually reads. No source is claimed as legal advice, and the operator is responsible for respecting each source's terms and applicable law.
 10. Delivery retry behavior prioritizes avoiding duplicate Kindle documents.
 11. Cloud operation must not depend on Hermes or a powered-on personal computer.
 12. Language preference is a ranking signal, not a hard availability filter.

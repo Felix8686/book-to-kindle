@@ -38,6 +38,7 @@ HTTP / future Hermes ----------------+
                          | Gutendex / Gutenberg
                          | Google Books Free
                          | Internet Archive Public
+                         | ZLibrary (account-based)
                                       |
                                       v
                                      R2
@@ -53,7 +54,7 @@ Heavy repair/conversion tools such as Shelfmark, Calibre or CWA are deliberately
 
 ## Current status
 
-**v0.5.1 — language preferences, multi-source discovery and cancellation/Queue reliability fixes**
+**v0.6.0 — ZLibrary source, language preferences, multi-source discovery and cancellation/Queue reliability fixes**
 
 Implemented:
 
@@ -77,6 +78,7 @@ Implemented:
 - Gutendex / Project Gutenberg source;
 - Google Books Free source;
 - Internet Archive public-access source;
+- ZLibrary account-based source (search + personal-domain download);
 - cross-source normalization, ranking and deduplication;
 - edition-safe fallback deduplication when no shared ISBN is available;
 - Queue-enqueue recovery without leaving Telegram-created tasks stuck in `queued`;
@@ -149,11 +151,12 @@ Enabled `SourceAdapter`s:
 GutendexSource
 GoogleBooksFreeSource
 InternetArchivePublicSource
+ZLibrarySource
 ```
 
 The workflow searches sources independently and uses normalized scoring rather than whichever source responds first.
 
-Google Books candidates must be full/free downloadable volumes with an actual EPUB/PDF download link. Internet Archive candidates must be Open Library `ebook_access=public` records with non-restricted/non-private EPUB/PDF files.
+Google Books candidates must be full/free downloadable volumes with an actual EPUB/PDF download link. Internet Archive candidates must be Open Library `ebook_access=public` records with non-restricted/non-private EPUB/PDF files. ZLibrary candidates require account credentials (`ZLIBRARY_EMAIL`/`ZLIBRARY_PASSWORD` or `ZLIBRARY_REMIX_USERID`/`ZLIBRARY_REMIX_USERKEY`) and are fetched through the official JSON `/eapi/` interface, with downloads restricted to the account's personal domains.
 
 Standard Ebooks and OAPEN remain desirable future sources, but are not default dependencies until a stable anonymous machine-access contract is verified for the project. See [`docs/SOURCES.md`](docs/SOURCES.md).
 
@@ -337,7 +340,8 @@ v0.5 reports the active resolver/source set, including:
 ```json
 {
   "resolvers": ["openlibrary", "google-books"],
-  "sources": ["gutendex", "google-books-free", "internet-archive-public"],
+  "sources": ["gutendex", "google-books-free", "internet-archive-public", "zlibrary"],
+  "zlibrary": "configured",
   "defaultLanguage": "zh",
   "vision": "workers_ai"
 }
@@ -408,6 +412,7 @@ src/
     gutendex.ts                 Project Gutenberg source
     googlebooks.ts              Google Books free/full source
     internetarchive.ts          Internet Archive public source
+    zlibrary.ts                 ZLibrary account source
     gmail.ts                    Gmail Send-to-Kindle delivery
 migrations/
   0001_init.sql
