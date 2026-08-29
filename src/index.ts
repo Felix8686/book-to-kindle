@@ -1,4 +1,6 @@
 import type { BookRequest, Env, TaskQueueMessage } from "./domain";
+import { GmailDelivery, isGmailConfigured } from "./adapters/gmail";
+import { GutendexSource } from "./adapters/gutendex";
 import { TaskRepository } from "./repository";
 import { processTask } from "./workflow";
 
@@ -37,11 +39,26 @@ function validateBookRequest(value: unknown): BookRequest | null {
   };
 }
 
+async function readJson(request: Request): Promise<Record<string, unknown> | null> {
+  try {
+    const value = await request.json();
+    return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
   if (request.method === "GET" && url.pathname === "/health") {
-    return json({ ok: true, service: "book-to-kindle", environment: env.APP_ENV ?? "unknown" });
+    return json({
+      ok: true,
+      service: "book-to-kindle",
+      environment: env.APP_ENV ?? "unknown",
+      source: "gutendex",
+      delivery: isGmailConfigured(env) && env.KINDLE_EMAIL ? "gmail" : "not_configured",
+    });
   }
 
   if (!isAuthorized(request, env)) return unauthorized();
@@ -49,13 +66,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   const repo = new TaskRepository(env.DB);
 
   if (request.method === "POST" && url.pathname === "/api/v1/tasks") {
-    let body: unknown;
-    try {
-      body = await request.json();
-    } catch {
-      return json({ error: "invalid_json" }, { status: 400 });
-    }
-
+    const body = await readJson(request);
     const bookRequest = validateBookRequest(body);
     if (!bookRequest) {
       return json(
@@ -74,14 +85,44 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return json({ id, status: "queued" }, { status: 202 });
   }
 
-  const match = url.pathname.match(/^\/api\/v1\/tasks\/([0-9a-f-]+)$/i);
-  if (request.method === "GET" && match) {
-    const task = await repo.get(match[1]);
+  const taskMatch = url.pathname.match(/^\/api\/v1\/tasks\/([0-9a-f-]+)$/i);
+  if (request.method === "GET" && taskMatch) {
+    const task = await repo.get(taskMatch[1]);
     if (!task) return json({ error: "not_found" }, { status: 404 });
     return json(task);
   }
 
+  const selectionMatch = url.pathname.match(/^\/api\/v1\/tasks\/([0-9a-f-]+)\/select$/i);
+  if (request.method === "POST" && selectionMatch) {
+    const task = await repo.get(selectionMatch[1]);
+    if (!task) return json({ error: "not_found" }, { status: 404 });
+    if (task.status !== "needs_selection" || !task.candidates?.length) {
+      return json({ error: "task_not_waiting_for_selection" }, { status: 409 });
+    }
+
+    const body = await readJson(request);
+    const candidateId = body && typeof body.candidateId === "string" ? body.candidateId : undefined;
+    if (!candidateId) return json({ error: "candidateId_required" }, { status: 400 });
+
+    const selected = task.candidates.find((candidate) => candidate.id === candidateId);
+    if (!selected) return json({ error: "candidate_not_found" }, { status: 404 });
+
+    await repo.update(task.id, {
+      status: "queued",
+      candidates: null,
+      selectedCandidate: selected,
+      errorMessage: null,
+    });
+    await env.TASK_QUEUE.send({ taskId: task.id });
+
+    return json({ id: task.id, status: "queued", selectedCandidate: selected }, { status: 202 });
+  }
+
   return json({ error: "not_found" }, { status: 404 });
+}
+
+function sources() {
+  return [new GutendexSource()];
 }
 
 export default {
@@ -90,12 +131,14 @@ export default {
   },
 
   async queue(batch: MessageBatch<TaskQueueMessage>, env: Env): Promise<void> {
+    const delivery = isGmailConfigured(env) ? new GmailDelivery(env) : undefined;
+
     for (const message of batch.messages) {
       try {
         await processTask(message.body.taskId, {
           env,
-          sources: [],
-          delivery: undefined,
+          sources: sources(),
+          delivery,
         });
         message.ack();
       } catch (error) {
