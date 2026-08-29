@@ -2,16 +2,16 @@
 
 > Say what you want to read. Let the workflow deliver it to your Kindle.
 
-Book to Kindle is a lightweight, Cloudflare-first workflow for sending ebooks to Kindle with as little manual work as possible. The same codebase is designed to run either locally or on Cloudflare, so the workflow can keep working even when your PC is turned off.
+Book to Kindle is a lightweight, Cloudflare-first workflow for sending ebooks to Kindle with as little manual work as possible. The same codebase is designed to run locally or on Cloudflare, so the workflow can keep working even when your PC is turned off.
 
 ## Goals
 
 - **One intent, one workflow** — accept a book request from Telegram, Hermes, another AI agent, or a plain HTTP client.
 - **Local or cloud** — use the same core workflow in local development and Cloudflare deployment.
-- **Cloudflare Free friendly** — keep the always-on path inside Workers, Queues, D1 and R2 limits; move heavyweight conversion to optional local adapters.
+- **Cloudflare Free friendly** — keep the always-on path inside Workers, Queues, D1 and R2; move heavyweight conversion to optional local adapters.
 - **Asynchronous by default** — HTTP requests enqueue work instead of blocking while files are fetched or delivered.
-- **Provider-neutral** — discovery/download and delivery are adapter interfaces rather than hard-coded to one website or one email provider.
-- **Legal-source first** — bundled providers should only target content the user is authorized to obtain; third-party source adapters are separate integrations.
+- **Provider-neutral** — discovery/download and delivery are adapter interfaces rather than hard-coded into orchestration.
+- **Legal-source first** — bundled providers only target content the user is authorized to obtain.
 
 ## Architecture
 
@@ -29,48 +29,55 @@ Telegram / Hermes / HTTP
           |
           v
   Source Adapter
+   (Gutendex)
           |
           v
-         R2  <-----------------------+
-          |                           |
-          v                           |
- Delivery Adapter                    |
-   (Gmail API)                        |
-          |                           |
-          v                           |
-       Kindle                         |
-                                      |
-Optional local enhancement node ------+
+         R2
+          |
+          v
+ Delivery Adapter
+   (Gmail API)
+          |
+          v
+       Kindle
+
+Optional local enhancement node
 (Shelfmark / CWA / Calibre)
 ```
 
-### Why this shape?
-
-Cloudflare Workers are excellent as a lightweight always-on control plane, but they are not a Docker host and should not be treated like a VPS. Heavy ebook repair/conversion remains optional. If the requested file is already Kindle-compatible (for example EPUB or PDF), the Cloudflare path can complete the job without a PC.
+Cloudflare is the always-on control plane, not a VPS replacement. Heavy ebook repair/conversion remains optional. If a requested file is already Kindle-compatible, the Cloudflare path can complete the job without a PC.
 
 ## Current status
 
-**v0.1.0 — architecture bootstrap / MVP skeleton**
+**v0.2.0 — first end-to-end cloud delivery path**
 
-Implemented in the initial skeleton:
+Implemented:
 
 - Cloudflare Worker HTTP API
 - D1-backed task state
-- Queue-based asynchronous task processing
-- R2 temporary object storage binding
-- provider/delivery adapter boundaries
-- simple token authentication for API calls
+- Queue-based asynchronous processing
+- R2 temporary ebook staging
+- deterministic candidate ranking
+- ambiguity protection with persisted candidate lists
+- manual candidate-selection endpoint
+- built-in Gutendex / Project Gutenberg public-domain source adapter
+- Project Gutenberg download-domain allowlist
+- EPUB/PDF signature validation before staging
+- streaming file-size guardrail
+- Gmail OAuth refresh-token flow
+- Gmail `message/rfc822` media-upload delivery
+- duplicate-send guard when a previous delivery outcome is unknown
 - local execution through Wrangler
-- initial D1 schema and project documentation
+- GitHub Actions TypeScript validation
 
-Not yet implemented:
+Still planned:
 
-- production Telegram webhook parsing
-- Hermes MCP/Skill adapter
-- production book discovery/download providers
-- Gmail OAuth setup and attachment delivery
-- optional Shelfmark/CWA/Calibre local enhancement adapter
-- automatic source ranking and ambiguity confirmation
+- Telegram webhook entry point
+- Hermes Skill/MCP adapter
+- browser/share-sheet entry point
+- optional Shelfmark/CWA/Calibre local enhancement node
+- richer delivery receipts/retry controls
+- additional authorized/public-domain source adapters
 
 ## API
 
@@ -82,8 +89,8 @@ Authorization: Bearer <API_TOKEN>
 Content-Type: application/json
 
 {
-  "query": "The Little Prince",
-  "author": "Antoine de Saint-Exupéry",
+  "query": "Pride and Prejudice",
+  "author": "Jane Austen",
   "language": "en",
   "preferredFormat": "epub"
 }
@@ -105,11 +112,36 @@ GET /api/v1/tasks/<id>
 Authorization: Bearer <API_TOKEN>
 ```
 
+Typical terminal states:
+
+- `delivered` — sent successfully
+- `needs_selection` — several plausible editions were found
+- `needs_source` — no compatible public-domain source was found
+- `failed` — processing or delivery failed
+
+### Resolve an ambiguous match
+
+When a task returns `needs_selection`, its response includes a ranked `candidates` array. Select one by ID:
+
+```http
+POST /api/v1/tasks/<id>/select
+Authorization: Bearer <API_TOKEN>
+Content-Type: application/json
+
+{
+  "candidateId": "gutenberg:1342:epub"
+}
+```
+
+The task is then re-queued and continues from download.
+
 ### Health check
 
 ```http
 GET /health
 ```
+
+The health response reports whether Gmail delivery is configured, without exposing secrets.
 
 ## Local development
 
@@ -124,61 +156,95 @@ npm run db:migrate:local
 npm run dev
 ```
 
-Wrangler runs the Worker, D1, R2 and Queue bindings locally. This gives us a local deployment without maintaining a second backend implementation.
-
 Create `.dev.vars`:
 
 ```dotenv
 API_TOKEN=replace-with-a-long-random-value
 KINDLE_EMAIL=your-kindle-address@kindle.com
+GMAIL_CLIENT_ID=...
+GMAIL_CLIENT_SECRET=...
+GMAIL_REFRESH_TOKEN=...
+GMAIL_FROM_EMAIL=your-gmail-address@gmail.com
 ```
+
+See [`docs/GMAIL_OAUTH.md`](docs/GMAIL_OAUTH.md) for the Gmail setup.
 
 ## Cloudflare deployment
 
-1. Create a D1 database and R2 bucket.
-2. Create the Queue bindings described in `wrangler.toml`.
-3. Replace placeholder IDs in `wrangler.toml`.
-4. Add secrets with Wrangler:
+1. Create a D1 database, R2 bucket, task queue and dead-letter queue.
+2. Replace the D1 placeholder ID in `wrangler.toml`.
+3. Store all credentials with Wrangler secrets.
+4. Apply migrations.
+5. Deploy.
 
 ```bash
-npx wrangler secret put API_TOKEN
-npx wrangler secret put KINDLE_EMAIL
-```
-
-5. Apply migrations and deploy:
-
-```bash
+npm install
 npm run db:migrate:remote
 npm run deploy
 ```
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) before deploying.
+Detailed steps are in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## Cloudflare Free design rules
 
-The project deliberately follows these rules:
-
-1. Keep request handlers short; enqueue long-running work.
+1. Keep HTTP request handlers short and enqueue long-running work.
 2. Store ebook bytes in R2, never D1.
 3. Put only task metadata/status in D1.
-4. Avoid Docker/Calibre in the Cloudflare path.
-5. Treat large conversion/repair as an optional local enhancement.
-6. Delete temporary R2 objects after delivery unless retention is explicitly enabled.
+4. Avoid Docker/Calibre/native binaries in the Cloudflare core path.
+5. Stream downloads and delivery rather than buffering entire books in memory.
+6. Reject files above the configured cloud-path threshold.
+7. Delete temporary R2 objects after confirmed delivery.
+
+The default cloud-path threshold is currently **20 MiB**. Gmail personal accounts have a 25 MB attachment ceiling, so the project leaves headroom instead of targeting that limit directly.
+
+## Built-in source
+
+The first bundled provider is **Gutendex**, an API over Project Gutenberg metadata. The adapter:
+
+- requests only entries marked `copyright=false` by Gutendex;
+- supports title/author search and language filtering;
+- exposes EPUB/PDF candidates;
+- only follows downloads hosted under `gutenberg.org`;
+- validates basic EPUB/PDF file signatures before R2 staging.
+
+Copyright status varies by jurisdiction. Users remain responsible for ensuring they are allowed to obtain and use a specific file.
+
+## Gmail / Kindle delivery
+
+The delivery adapter uses Gmail OAuth with the `gmail.send` scope. It refreshes a short-lived access token only when needed, creates a MIME message, streams the staged ebook into it, and sends it through Gmail's media-upload endpoint.
+
+Required secrets:
+
+```text
+KINDLE_EMAIL
+GMAIL_CLIENT_ID
+GMAIL_CLIENT_SECRET
+GMAIL_REFRESH_TOKEN
+GMAIL_FROM_EMAIL
+```
+
+The Gmail sender must also be allowed by the user's Amazon Send to Kindle settings.
 
 ## Repository layout
 
 ```text
 src/
-  index.ts              Worker entry point and queue consumer
-  domain.ts             shared request/task types
-  repository.ts         D1 task repository
-  workflow.ts           platform-neutral orchestration
-  adapters/             source and delivery adapters
-migrations/             D1 schema migrations
+  index.ts                  Worker entry point + API + queue consumer
+  domain.ts                 shared request/task/adapter types
+  repository.ts             D1 task repository
+  workflow.ts               platform-neutral orchestration
+  adapters/
+    gutendex.ts              public-domain search/download adapter
+    gmail.ts                 Gmail Send-to-Kindle delivery adapter
+migrations/
+  0001_init.sql
+  0002_candidates.sql
 docs/
-  ARCHITECTURE.md        design decisions
-  DEPLOYMENT.md          local + Cloudflare deployment
-CHANGELOG.md             project history
+  ARCHITECTURE.md
+  DEPLOYMENT.md
+  GMAIL_OAUTH.md
+  REPOSITORY_METADATA.md
+CHANGELOG.md
 ```
 
 ## Roadmap
@@ -189,33 +255,36 @@ CHANGELOG.md             project history
 - Queue execution
 - R2 staging
 
-### v0.2 — Kindle delivery
-- Gmail OAuth
-- Send-to-Kindle delivery
-- delivery receipts and retry policy
+### v0.2 — Real cloud path
+- Gutendex / Project Gutenberg adapter
+- candidate confirmation endpoint
+- Gmail OAuth delivery
+- streaming upload and file validation
 
 ### v0.3 — AI entry points
 - Telegram webhook
 - Hermes adapter
-- book-title/author extraction
-- ambiguity confirmation
+- natural-language book request extraction
+- ambiguity confirmation through chat
 
 ### v0.4 — Source intelligence
-- pluggable legal/public-domain providers
-- format/language ranking
-- duplicate and quality checks
+- additional authorized/public-domain providers
+- duplicate/edition quality checks
+- stronger metadata matching
 
 ### v0.5 — Optional local enhancement
 - Shelfmark adapter
 - Calibre/CWA processing node
-- repair/convert fallback when Cloudflare cannot handle a file directly
+- repair/convert fallback for files Cloudflare should not process
 
 ## Security
 
 - Secrets belong in Wrangler secrets / `.dev.vars`, never Git.
 - API endpoints require a bearer token except `/health`.
-- Download adapters must use explicit allowlists and validate content type/size before storing files.
-- Temporary files should be removed after delivery.
+- Bundled download adapters use explicit host allowlists.
+- File type, signature and size are validated before staging.
+- Temporary files are removed after confirmed delivery.
+- Automatic resend is blocked when delivery outcome is uncertain, reducing duplicate Kindle documents.
 
 ## License
 
