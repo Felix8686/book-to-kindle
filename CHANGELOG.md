@@ -7,12 +7,40 @@ The project follows Semantic Versioning while it is practical to do so.
 ## [Unreleased]
 
 ### Planned
-- Gmail OAuth delivery adapter
 - Telegram webhook entry point
 - Hermes Skill/MCP bridge
-- production source adapters
-- candidate confirmation endpoint
+- browser/share-sheet entry point
 - optional Shelfmark/CWA/Calibre enhancement node
+- richer delivery receipts and explicit retry controls
+- additional authorized/public-domain source adapters
+
+## [0.2.0] - 2026-08-29
+
+### Added
+- Gutendex / Project Gutenberg public-domain source adapter
+- title/author search with language and EPUB/PDF filtering
+- persisted ranked candidate lists in D1
+- `POST /api/v1/tasks/:id/select` ambiguity-resolution endpoint
+- Gmail OAuth refresh-token support
+- Gmail `message/rfc822` media-upload Send-to-Kindle delivery
+- streaming R2-to-Gmail MIME delivery path
+- configurable cloud file-size guardrail (`MAX_CLOUD_FILE_BYTES`)
+- EPUB/PDF file-signature validation before staging
+- Project Gutenberg HTTPS download-host allowlist
+- Gmail OAuth setup documentation
+- end-to-end local and Cloudflare deployment instructions
+
+### Changed
+- activated the real source and delivery adapters in the queue consumer
+- default cloud ebook threshold set to 20 MiB
+- health endpoint now reports source and delivery configuration state
+- README and architecture documentation updated for the first usable cloud path
+
+### Safety / reliability
+- low-confidence matches pause at `needs_selection` instead of silently sending the first result
+- download streams are stopped when they exceed the configured cloud limit
+- redirects outside the Project Gutenberg allowlist are rejected
+- tasks found in an uncertain `delivering` state are not automatically resent, reducing duplicate Kindle documents
 
 ## [0.1.0] - 2026-08-29
 
