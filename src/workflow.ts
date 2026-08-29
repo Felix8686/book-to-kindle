@@ -1,9 +1,15 @@
 import type { BookCandidate, DeliveryAdapter, Env, SourceAdapter, TaskRecord } from "./domain";
 import { TaskRepository } from "./repository";
 
-const MAX_CLOUD_FILE_BYTES = 24 * 1024 * 1024;
+const DEFAULT_MAX_CLOUD_FILE_BYTES = 20 * 1024 * 1024;
 
-function candidateScore(candidate: BookCandidate, task: TaskRecord): number {
+function maxCloudFileBytes(env: Env): number {
+  const configured = Number(env.MAX_CLOUD_FILE_BYTES);
+  if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_MAX_CLOUD_FILE_BYTES;
+  return Math.min(configured, 24 * 1024 * 1024);
+}
+
+export function candidateScore(candidate: BookCandidate, task: TaskRecord): number {
   let score = 0;
   const query = task.request.query.toLowerCase();
   const title = candidate.title.toLowerCase();
@@ -17,20 +23,26 @@ function candidateScore(candidate: BookCandidate, task: TaskRecord): number {
     if (author.includes(requestedAuthor) || requestedAuthor.includes(author)) score += 25;
   }
 
-  if (task.request.language && candidate.language === task.request.language) score += 15;
+  if (task.request.language && candidate.language) {
+    const requestedLanguage = task.request.language.toLowerCase();
+    const language = candidate.language.toLowerCase();
+    if (language === requestedLanguage || language.startsWith(requestedLanguage.slice(0, 2))) score += 15;
+  }
+
   if (task.request.preferredFormat && candidate.format === task.request.preferredFormat) score += 10;
-  if (candidate.sizeBytes && candidate.sizeBytes > MAX_CLOUD_FILE_BYTES) score -= 100;
+  if (candidate.sizeBytes && candidate.sizeBytes > maxCloudFileBytes({} as Env)) score -= 100;
 
   return score;
 }
 
-function selectCandidate(candidates: BookCandidate[], task: TaskRecord): BookCandidate | null {
-  if (candidates.length === 0) return null;
-
-  const ranked = candidates
+function rankedCandidates(candidates: BookCandidate[], task: TaskRecord): BookCandidate[] {
+  return candidates
     .map((candidate) => ({ ...candidate, score: candidateScore(candidate, task) }))
     .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+}
 
+function autoSelect(ranked: BookCandidate[]): BookCandidate | null {
+  if (ranked.length === 0) return null;
   const best = ranked[0];
   const second = ranked[1];
 
@@ -50,48 +62,71 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
   const task = await repo.get(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
 
+  if (task.status === "delivered") return;
+  if (task.status === "delivering") {
+    await repo.update(taskId, {
+      status: "failed",
+      errorMessage: "Previous delivery outcome is unknown; automatic resend was blocked to avoid duplicates.",
+    });
+    return;
+  }
+  if (task.status === "needs_selection" && !task.selectedCandidate) return;
+
   try {
-    await repo.update(taskId, { status: "searching", errorMessage: null });
-
-    if (deps.sources.length === 0) {
-      await repo.update(taskId, {
-        status: "needs_source",
-        errorMessage: "No source adapter is configured yet.",
-      });
-      return;
-    }
-
-    const resultSets = await Promise.all(
-      deps.sources.map(async (source) => {
-        try {
-          return await source.search(task.request);
-        } catch {
-          return [];
-        }
-      }),
-    );
-
-    const candidates = resultSets.flat();
-    const selected = selectCandidate(candidates, task);
+    let selected = task.selectedCandidate;
 
     if (!selected) {
-      await repo.update(taskId, {
-        status: candidates.length > 0 ? "needs_selection" : "needs_source",
-        errorMessage:
-          candidates.length > 0
-            ? "Multiple or low-confidence candidates require confirmation."
-            : "No compatible source was found.",
-      });
-      return;
+      await repo.update(taskId, { status: "searching", errorMessage: null });
+
+      if (deps.sources.length === 0) {
+        await repo.update(taskId, {
+          status: "needs_source",
+          errorMessage: "No source adapter is configured.",
+        });
+        return;
+      }
+
+      const resultSets = await Promise.all(
+        deps.sources.map(async (source) => {
+          try {
+            return await source.search(task.request);
+          } catch (error) {
+            console.warn(`Source ${source.name} failed`, error);
+            return [];
+          }
+        }),
+      );
+
+      const ranked = rankedCandidates(resultSets.flat(), task).slice(0, 10);
+      selected = autoSelect(ranked) ?? undefined;
+
+      if (!selected) {
+        await repo.update(taskId, {
+          status: ranked.length > 0 ? "needs_selection" : "needs_source",
+          candidates: ranked.length > 0 ? ranked : null,
+          errorMessage:
+            ranked.length > 0
+              ? "Multiple or low-confidence candidates require confirmation."
+              : "No compatible public-domain source was found.",
+        });
+        return;
+      }
     }
 
-    const source = deps.sources.find((item) => item.name === selected.source);
+    const source = deps.sources.find((item) => item.name === selected!.source);
     if (!source) throw new Error(`Missing source adapter: ${selected.source}`);
 
-    await repo.update(taskId, { status: "downloading", selectedCandidate: selected });
-    const download = await source.download(selected);
+    await repo.update(taskId, {
+      status: "downloading",
+      candidates: null,
+      selectedCandidate: selected,
+      errorMessage: null,
+    });
 
-    if (download.sizeBytes && download.sizeBytes > MAX_CLOUD_FILE_BYTES) {
+    const cloudLimit = maxCloudFileBytes(deps.env);
+    const download = await source.download(selected, { maxBytes: cloudLimit });
+
+    if (download.sizeBytes && download.sizeBytes > cloudLimit) {
       throw new Error("File is too large for the Cloudflare delivery path; use a local enhancement node.");
     }
 
@@ -110,7 +145,7 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
     if (!deps.delivery || !deps.env.KINDLE_EMAIL) {
       await repo.update(taskId, {
         status: "staged",
-        errorMessage: "File staged in R2; delivery adapter is not configured yet.",
+        errorMessage: "File staged in R2; delivery adapter is not configured.",
       });
       return;
     }
