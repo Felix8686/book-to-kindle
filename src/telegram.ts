@@ -1,5 +1,16 @@
-import type { BookCandidate, BookRequest, Env, TaskRecord } from "./domain";
+import type {
+  BookCandidate,
+  BookRequest,
+  Env,
+  TaskRecord,
+  TelegramImageQueueMessage,
+} from "./domain";
 import { TaskRepository } from "./repository";
+
+const VISION_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct" as const;
+const DEFAULT_MAX_TELEGRAM_IMAGE_BYTES = 4 * 1024 * 1024;
+const HARD_MAX_TELEGRAM_IMAGE_BYTES = 6 * 1024 * 1024;
+const IMAGE_CHOICE_TTL_HOURS = 24;
 
 interface TelegramUser {
   id: number;
@@ -12,11 +23,28 @@ interface TelegramChat {
   type: string;
 }
 
+interface TelegramPhotoSize {
+  file_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
+interface TelegramDocument {
+  file_id: string;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+}
+
 interface TelegramMessage {
   message_id: number;
   from?: TelegramUser;
   chat: TelegramChat;
   text?: string;
+  caption?: string;
+  photo?: TelegramPhotoSize[];
+  document?: TelegramDocument;
 }
 
 interface TelegramCallbackQuery {
@@ -38,6 +66,28 @@ interface TelegramTaskLink {
   userId: string;
   sourceMessageId?: number;
   lastNotifiedStatus?: string;
+}
+
+interface RecognizedBook {
+  title: string;
+  author?: string;
+  language?: string;
+  confidence: number;
+}
+
+interface TelegramImageChoiceRecord {
+  id: string;
+  chatId: string;
+  userId: string;
+  sourceMessageId?: number;
+  choices: RecognizedBook[];
+  expiresAt: string;
+}
+
+interface TelegramFileInfo {
+  file_id?: string;
+  file_size?: number;
+  file_path?: string;
 }
 
 interface InlineKeyboardButton {
@@ -73,13 +123,7 @@ class TelegramTaskLinkRepository {
            source_message_id = excluded.source_message_id,
            updated_at = excluded.updated_at`,
       )
-      .bind(
-        input.taskId,
-        input.chatId,
-        input.userId,
-        input.sourceMessageId ?? null,
-        now,
-      )
+      .bind(input.taskId, input.chatId, input.userId, input.sourceMessageId ?? null, now)
       .run();
   }
 
@@ -146,9 +190,101 @@ class TelegramTaskLinkRepository {
   }
 }
 
+class TelegramImageChoiceRepository {
+  constructor(private readonly db: D1Database) {}
+
+  async create(input: {
+    chatId: string;
+    userId: string;
+    sourceMessageId?: number;
+    choices: RecognizedBook[];
+  }): Promise<TelegramImageChoiceRecord> {
+    const id = crypto.randomUUID();
+    const now = new Date();
+    const expires = new Date(now.getTime() + IMAGE_CHOICE_TTL_HOURS * 60 * 60 * 1000);
+
+    await this.db
+      .prepare(`DELETE FROM telegram_image_choices WHERE expires_at < ?1`)
+      .bind(now.toISOString())
+      .run();
+
+    await this.db
+      .prepare(
+        `INSERT INTO telegram_image_choices
+           (id, chat_id, user_id, source_message_id, choices_json, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+      )
+      .bind(
+        id,
+        input.chatId,
+        input.userId,
+        input.sourceMessageId ?? null,
+        JSON.stringify(input.choices),
+        now.toISOString(),
+        expires.toISOString(),
+      )
+      .run();
+
+    return {
+      id,
+      chatId: input.chatId,
+      userId: input.userId,
+      sourceMessageId: input.sourceMessageId,
+      choices: input.choices,
+      expiresAt: expires.toISOString(),
+    };
+  }
+
+  async get(id: string): Promise<TelegramImageChoiceRecord | null> {
+    const row = await this.db
+      .prepare(
+        `SELECT id, chat_id, user_id, source_message_id, choices_json, expires_at
+         FROM telegram_image_choices WHERE id = ?1`,
+      )
+      .bind(id)
+      .first<Record<string, unknown>>();
+
+    if (!row) return null;
+    if (Date.parse(String(row.expires_at)) <= Date.now()) {
+      await this.delete(id);
+      return null;
+    }
+
+    let choices: RecognizedBook[];
+    try {
+      choices = JSON.parse(String(row.choices_json)) as RecognizedBook[];
+    } catch {
+      await this.delete(id);
+      return null;
+    }
+
+    return {
+      id: String(row.id),
+      chatId: String(row.chat_id),
+      userId: String(row.user_id),
+      sourceMessageId:
+        row.source_message_id === null || row.source_message_id === undefined
+          ? undefined
+          : Number(row.source_message_id),
+      choices,
+      expiresAt: String(row.expires_at),
+    };
+  }
+
+  async delete(id: string): Promise<void> {
+    await this.db.prepare(`DELETE FROM telegram_image_choices WHERE id = ?1`).bind(id).run();
+  }
+}
+
 function telegramApiUrl(env: Env, method: string): string {
   if (!env.TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
   return `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
+}
+
+function telegramFileUrl(env: Env, filePath: string): string {
+  if (!env.TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
+  const safePath = filePath.split("/").map(encodeURIComponent).join("/");
+  return `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${safePath}`;
 }
 
 async function telegramApi<T>(
@@ -169,9 +305,7 @@ async function telegramApi<T>(
   };
 
   if (!response.ok || !data.ok) {
-    throw new Error(
-      `Telegram ${method} failed: ${data.description || `HTTP ${response.status}`}`,
-    );
+    throw new Error(`Telegram ${method} failed: ${data.description || `HTTP ${response.status}`}`);
   }
 
   return data.result as T;
@@ -215,6 +349,12 @@ function isAllowedUser(env: Env, userId: string): boolean {
   return allowed.size > 0 && allowed.has(userId);
 }
 
+function maxTelegramImageBytes(env: Env): number {
+  const configured = Number(env.MAX_TELEGRAM_IMAGE_BYTES);
+  if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_MAX_TELEGRAM_IMAGE_BYTES;
+  return Math.min(configured, HARD_MAX_TELEGRAM_IMAGE_BYTES);
+}
+
 function cleanTitle(value: string): string {
   return value
     .replace(/^\s*[：:,-]+|[：:,-]+\s*$/g, "")
@@ -223,27 +363,28 @@ function cleanTitle(value: string): string {
     .slice(0, 300);
 }
 
+function explicitLanguage(text?: string): string | undefined {
+  if (!text) return undefined;
+  if (/(?:中文|中文版|chinese)/i.test(text)) return "zh";
+  if (/(?:英文|英语|english)/i.test(text)) return "en";
+  return undefined;
+}
+
+function explicitFormat(text?: string): "epub" | "pdf" {
+  return text && /\bpdf\b/i.test(text) ? "pdf" : "epub";
+}
+
 export function parseTelegramBookRequest(text: string): BookRequest | null {
   const original = text.trim();
   if (!original) return null;
-  if (
-    original.startsWith("/") &&
-    !/^\/(?:send|book)(?:@\w+)?\s+/i.test(original)
-  ) {
+  if (original.startsWith("/") && !/^\/(?:send|book)(?:@\w+)?\s+/i.test(original)) {
     return null;
   }
 
   const authorMatch = original.match(/(?:作者|author)\s*[：:]?\s*([^\n,，;；]+)/i);
   const author = authorMatch?.[1]?.trim().slice(0, 200);
-
-  const language = /(?:中文|中文版|chinese)/i.test(original)
-    ? "zh"
-    : /(?:英文|英语|english)/i.test(original)
-      ? "en"
-      : undefined;
-
-  const preferredFormat = /\bpdf\b/i.test(original) ? "pdf" : "epub";
-
+  const language = explicitLanguage(original);
+  const preferredFormat = explicitFormat(original);
   const chineseQuoted = original.match(/《([^》]{1,300})》/);
   const englishQuoted = original.match(/["“”']([^"“”']{1,300})["“”']/);
   let query = chineseQuoted?.[1] ?? englishQuoted?.[1];
@@ -265,22 +406,22 @@ export function parseTelegramBookRequest(text: string): BookRequest | null {
   const cleaned = cleanTitle(query);
   if (!cleaned) return null;
 
-  return {
-    query: cleaned,
-    author,
-    language,
-    preferredFormat,
-  };
+  return { query: cleaned, author, language, preferredFormat };
 }
 
 function helpText(): string {
   return [
     "Book to Kindle 已连接。",
     "",
-    "直接发送书名即可，例如：",
+    "可以直接发送书名，也可以发送清晰的书籍封面/截图。",
+    "例如：",
     "把《Pride and Prejudice》发到 Kindle",
     "Pride and Prejudice",
     "《The Little Prince》 PDF",
+    "或者直接发一张书封面图片。",
+    "",
+    "图片说明文字可写：PDF、中文、英文等偏好。",
+    "若图片里有多本书或识别不够确定，机器人会让你点选。",
     "",
     "命令：",
     "/send <书名>  创建任务",
@@ -291,9 +432,7 @@ function helpText(): string {
 }
 
 function candidateLabel(candidate: BookCandidate, index: number): string {
-  const details = [candidate.format.toUpperCase(), candidate.language]
-    .filter(Boolean)
-    .join(" · ");
+  const details = [candidate.format.toUpperCase(), candidate.language].filter(Boolean).join(" · ");
   const label = `${index + 1}. ${candidate.title}${details ? ` · ${details}` : ""}`;
   return label.length > 60 ? `${label.slice(0, 57)}...` : label;
 }
@@ -302,11 +441,27 @@ function selectionKeyboard(task: TaskRecord): TelegramSendOptions["reply_markup"
   if (!task.candidates?.length) return undefined;
   return {
     inline_keyboard: task.candidates.slice(0, 5).map((candidate, index) => [
-      {
-        text: candidateLabel(candidate, index),
-        callback_data: `sel:${task.id}:${index}`,
-      },
+      { text: candidateLabel(candidate, index), callback_data: `sel:${task.id}:${index}` },
     ]),
+  };
+}
+
+function imageChoiceLabel(book: RecognizedBook, index: number): string {
+  const author = book.author ? ` · ${book.author}` : "";
+  const value = `${index + 1}. ${book.title}${author}`;
+  return value.length > 60 ? `${value.slice(0, 57)}...` : value;
+}
+
+function imageChoiceKeyboard(
+  record: TelegramImageChoiceRecord,
+): TelegramSendOptions["reply_markup"] {
+  return {
+    inline_keyboard: [
+      ...record.choices.slice(0, 5).map((book, index) => [
+        { text: imageChoiceLabel(book, index), callback_data: `img:${record.id}:${index}` },
+      ]),
+      [{ text: "取消", callback_data: `img:${record.id}:x` }],
+    ],
   };
 }
 
@@ -341,14 +496,29 @@ function taskStatusText(task: TaskRecord): string {
   }
 }
 
-async function sendTaskStatus(
-  env: Env,
-  chatId: string,
-  task: TaskRecord,
-): Promise<void> {
+async function sendTaskStatus(env: Env, chatId: string, task: TaskRecord): Promise<void> {
   await sendTelegramMessage(env, chatId, taskStatusText(task), {
     reply_markup: task.status === "needs_selection" ? selectionKeyboard(task) : undefined,
   });
+}
+
+async function createTelegramBookTask(input: {
+  env: Env;
+  chatId: string;
+  userId: string;
+  sourceMessageId?: number;
+  request: BookRequest;
+}): Promise<string> {
+  const taskId = crypto.randomUUID();
+  await new TaskRepository(input.env.DB).create(taskId, input.request);
+  await new TelegramTaskLinkRepository(input.env.DB).create({
+    taskId,
+    chatId: input.chatId,
+    userId: input.userId,
+    sourceMessageId: input.sourceMessageId,
+  });
+  await input.env.TASK_QUEUE.send({ kind: "book", taskId });
+  return taskId;
 }
 
 async function handleStatusCommand(
@@ -379,11 +549,41 @@ async function handleStatusCommand(
   await sendTaskStatus(env, String(message.chat.id), task);
 }
 
+function supportedDocumentImage(document?: TelegramDocument): boolean {
+  if (!document?.mime_type) return false;
+  return ["image/jpeg", "image/png", "image/webp"].includes(document.mime_type.toLowerCase());
+}
+
+function chooseTelegramImage(message: TelegramMessage): {
+  fileId: string;
+  declaredSizeBytes?: number;
+  mimeType?: string;
+} | null {
+  if (message.photo?.length) {
+    const largest = [...message.photo].sort((a, b) => b.width * b.height - a.width * a.height)[0];
+    return {
+      fileId: largest.file_id,
+      declaredSizeBytes: largest.file_size,
+      mimeType: "image/jpeg",
+    };
+  }
+
+  if (supportedDocumentImage(message.document)) {
+    return {
+      fileId: message.document!.file_id,
+      declaredSizeBytes: message.document!.file_size,
+      mimeType: message.document!.mime_type,
+    };
+  }
+
+  return null;
+}
+
 async function handleMessage(env: Env, message: TelegramMessage): Promise<void> {
-  if (!message.from || !message.text) return;
+  if (!message.from) return;
   const chatId = String(message.chat.id);
   const userId = String(message.from.id);
-  const text = message.text.trim();
+  const text = message.text?.trim();
 
   if (message.chat.type !== "private") {
     await sendTelegramMessage(env, chatId, "目前只支持与机器人私聊使用。", {
@@ -392,7 +592,7 @@ async function handleMessage(env: Env, message: TelegramMessage): Promise<void> 
     return;
   }
 
-  if (/^\/whoami(?:@\w+)?(?:\s|$)/i.test(text)) {
+  if (text && /^\/whoami(?:@\w+)?(?:\s|$)/i.test(text)) {
     await sendTelegramMessage(env, chatId, `你的 Telegram user ID：${userId}`, {
       reply_to_message_id: message.message_id,
     });
@@ -413,13 +613,53 @@ async function handleMessage(env: Env, message: TelegramMessage): Promise<void> 
     return;
   }
 
-  if (/^\/(?:start|help)(?:@\w+)?(?:\s|$)/i.test(text)) {
+  if (text && /^\/(?:start|help)(?:@\w+)?(?:\s|$)/i.test(text)) {
     await sendTelegramMessage(env, chatId, helpText());
     return;
   }
 
-  if (/^\/status(?:@\w+)?(?:\s|$)/i.test(text)) {
+  if (text && /^\/status(?:@\w+)?(?:\s|$)/i.test(text)) {
     await handleStatusCommand(env, message, userId);
+    return;
+  }
+
+  const image = chooseTelegramImage(message);
+  if (image) {
+    const maxBytes = maxTelegramImageBytes(env);
+    if (image.declaredSizeBytes && image.declaredSizeBytes > maxBytes) {
+      await sendTelegramMessage(
+        env,
+        chatId,
+        `图片太大，当前识图上限约为 ${(maxBytes / 1024 / 1024).toFixed(0)} MiB。请以“照片”方式发送，或先压缩图片。`,
+        { reply_to_message_id: message.message_id },
+      );
+      return;
+    }
+
+    await env.TASK_QUEUE.send({
+      kind: "telegram_image",
+      chatId,
+      userId,
+      sourceMessageId: message.message_id,
+      fileId: image.fileId,
+      caption: message.caption?.trim().slice(0, 500),
+      declaredSizeBytes: image.declaredSizeBytes,
+      mimeType: image.mimeType,
+    });
+
+    await sendTelegramMessage(env, chatId, "收到图片，正在识别书名和作者……", {
+      reply_to_message_id: message.message_id,
+    });
+    return;
+  }
+
+  if (!text) {
+    await sendTelegramMessage(
+      env,
+      chatId,
+      "暂时只支持文字、Telegram 照片，以及 JPEG/PNG/WebP 图片文件。",
+      { reply_to_message_id: message.message_id },
+    );
     return;
   }
 
@@ -431,18 +671,13 @@ async function handleMessage(env: Env, message: TelegramMessage): Promise<void> 
     return;
   }
 
-  const repo = new TaskRepository(env.DB);
-  const links = new TelegramTaskLinkRepository(env.DB);
-  const taskId = crypto.randomUUID();
-
-  await repo.create(taskId, bookRequest);
-  await links.create({
-    taskId,
+  await createTelegramBookTask({
+    env,
     chatId,
     userId,
     sourceMessageId: message.message_id,
+    request: bookRequest,
   });
-  await env.TASK_QUEUE.send({ taskId });
 
   await sendTelegramMessage(
     env,
@@ -452,10 +687,12 @@ async function handleMessage(env: Env, message: TelegramMessage): Promise<void> 
   );
 }
 
-async function handleCallbackQuery(env: Env, callback: TelegramCallbackQuery): Promise<void> {
-  const data = callback.data ?? "";
-  const match = data.match(/^sel:([0-9a-f-]+):(\d+)$/i);
-  if (!match || !callback.message) {
+async function handleSourceCandidateCallback(
+  env: Env,
+  callback: TelegramCallbackQuery,
+  match: RegExpMatchArray,
+): Promise<void> {
+  if (!callback.message) {
     await answerCallbackQuery(env, callback.id, "这个按钮已失效。");
     return;
   }
@@ -473,12 +710,7 @@ async function handleCallbackQuery(env: Env, callback: TelegramCallbackQuery): P
   const link = await links.get(taskId);
   const task = await repo.get(taskId);
 
-  if (
-    !link ||
-    link.userId !== userId ||
-    String(callback.message.chat.id) !== link.chatId ||
-    !task
-  ) {
+  if (!link || link.userId !== userId || String(callback.message.chat.id) !== link.chatId || !task) {
     await answerCallbackQuery(env, callback.id, "任务不存在或不属于你。");
     return;
   }
@@ -500,7 +732,7 @@ async function handleCallbackQuery(env: Env, callback: TelegramCallbackQuery): P
     selectedCandidate: selected,
     errorMessage: null,
   });
-  await env.TASK_QUEUE.send({ taskId });
+  await env.TASK_QUEUE.send({ kind: "book", taskId });
 
   await answerCallbackQuery(env, callback.id, "已选择，继续处理。");
   await sendTelegramMessage(
@@ -510,18 +742,334 @@ async function handleCallbackQuery(env: Env, callback: TelegramCallbackQuery): P
   );
 }
 
+async function handleImageChoiceCallback(
+  env: Env,
+  callback: TelegramCallbackQuery,
+  match: RegExpMatchArray,
+): Promise<void> {
+  if (!callback.message) {
+    await answerCallbackQuery(env, callback.id, "这个按钮已失效。");
+    return;
+  }
+
+  const userId = String(callback.from.id);
+  if (!isAllowedUser(env, userId)) {
+    await answerCallbackQuery(env, callback.id, "无权执行此操作。");
+    return;
+  }
+
+  const choiceId = match[1];
+  const selectedIndex = match[2];
+  const choicesRepo = new TelegramImageChoiceRepository(env.DB);
+  const record = await choicesRepo.get(choiceId);
+
+  if (!record || record.userId !== userId || record.chatId !== String(callback.message.chat.id)) {
+    await answerCallbackQuery(env, callback.id, "识图结果已过期或不属于你。");
+    return;
+  }
+
+  if (selectedIndex === "x") {
+    await choicesRepo.delete(choiceId);
+    await answerCallbackQuery(env, callback.id, "已取消。");
+    await sendTelegramMessage(env, record.chatId, "已取消这次图片识别任务。");
+    return;
+  }
+
+  const book = record.choices[Number(selectedIndex)];
+  if (!book) {
+    await answerCallbackQuery(env, callback.id, "这个候选项已失效。");
+    return;
+  }
+
+  const caption = callback.message.caption;
+  const request: BookRequest = {
+    query: book.title,
+    author: book.author,
+    language: explicitLanguage(caption),
+    preferredFormat: explicitFormat(caption),
+  };
+
+  await choicesRepo.delete(choiceId);
+  await createTelegramBookTask({
+    env,
+    chatId: record.chatId,
+    userId,
+    sourceMessageId: record.sourceMessageId,
+    request,
+  });
+
+  await answerCallbackQuery(env, callback.id, "已选择，开始处理。");
+  await sendTelegramMessage(env, record.chatId, `已选择《${book.title}》，开始查找并发送到 Kindle。`);
+}
+
+async function handleCallbackQuery(env: Env, callback: TelegramCallbackQuery): Promise<void> {
+  const data = callback.data ?? "";
+  const sourceMatch = data.match(/^sel:([0-9a-f-]+):(\d+)$/i);
+  if (sourceMatch) {
+    await handleSourceCandidateCallback(env, callback, sourceMatch);
+    return;
+  }
+
+  const imageMatch = data.match(/^img:([0-9a-f-]+):(\d+|x)$/i);
+  if (imageMatch) {
+    await handleImageChoiceCallback(env, callback, imageMatch);
+    return;
+  }
+
+  await answerCallbackQuery(env, callback.id, "这个按钮已失效。");
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x4000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const end = Math.min(offset + chunkSize, bytes.length);
+    for (let i = offset; i < end; i += 1) binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function detectImageMime(bytes: Uint8Array, hinted?: string): string | null {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47
+  ) {
+    return "image/png";
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+
+  const normalized = hinted?.split(";")[0].trim().toLowerCase();
+  return normalized && ["image/jpeg", "image/png", "image/webp"].includes(normalized)
+    ? normalized
+    : null;
+}
+
+function normalizeRecognition(value: unknown): RecognizedBook[] {
+  if (!value || typeof value !== "object") return [];
+  const books = (value as { books?: unknown }).books;
+  if (!Array.isArray(books)) return [];
+
+  const seen = new Set<string>();
+  const output: RecognizedBook[] = [];
+
+  for (const raw of books.slice(0, 8)) {
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    const title = typeof item.title === "string" ? cleanTitle(item.title) : "";
+    if (!title) continue;
+    const author = typeof item.author === "string" ? item.author.trim().slice(0, 200) : undefined;
+    const language = typeof item.language === "string" ? item.language.trim().slice(0, 32) : undefined;
+    const confidenceValue = Number(item.confidence);
+    const confidence = Number.isFinite(confidenceValue)
+      ? Math.max(0, Math.min(1, confidenceValue))
+      : 0.5;
+    const key = `${title.toLowerCase()}|${author?.toLowerCase() ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push({ title, author, language, confidence });
+  }
+
+  return output.sort((a, b) => b.confidence - a.confidence).slice(0, 5);
+}
+
+async function recognizeBooksFromImage(
+  env: Env,
+  imageBytes: Uint8Array,
+  mimeType: string,
+  caption?: string,
+): Promise<RecognizedBook[]> {
+  const image = `data:${mimeType};base64,${bytesToBase64(imageBytes)}`;
+  const prompt = [
+    "Identify books that are visibly present in this image.",
+    "Extract only titles that you can reasonably read or identify from the image itself.",
+    "For each book return its title, author if visible/known from the cover, language if apparent, and confidence from 0 to 1.",
+    "Do not invent a title from unrelated text. Return at most 5 books.",
+    caption ? `The user added this caption: ${caption}` : "The user added no caption.",
+  ].join("\n");
+
+  const raw = await env.AI.run(VISION_MODEL, {
+    messages: [
+      {
+        role: "system",
+        content:
+          "You extract bibliographic information from book covers, reading-app screenshots, bookstore photos, and book-list screenshots. Be conservative when text is unclear.",
+      },
+      { role: "user", content: prompt },
+    ],
+    image,
+    max_tokens: 384,
+    temperature: 0,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        type: "object",
+        properties: {
+          books: {
+            type: "array",
+            maxItems: 5,
+            items: {
+              type: "object",
+              properties: {
+                title: { type: "string" },
+                author: { type: "string" },
+                language: { type: "string" },
+                confidence: { type: "number" },
+              },
+              required: ["title", "author", "language", "confidence"],
+            },
+          },
+        },
+        required: ["books"],
+      },
+    },
+  });
+
+  const response = (raw as unknown as { response?: unknown }).response;
+  if (typeof response === "string") {
+    try {
+      return normalizeRecognition(JSON.parse(response));
+    } catch {
+      return [];
+    }
+  }
+  return normalizeRecognition(response);
+}
+
+function shouldAutoSelectRecognition(books: RecognizedBook[]): boolean {
+  if (books.length === 0) return false;
+  if (books.length === 1) return books[0].confidence >= 0.78;
+  return books[0].confidence >= 0.92 && books[1].confidence <= 0.55;
+}
+
+export async function processTelegramImageMessage(
+  job: TelegramImageQueueMessage,
+  env: Env,
+): Promise<void> {
+  if (!env.TELEGRAM_BOT_TOKEN) throw new Error("Telegram bot is not configured.");
+  if (!isAllowedUser(env, job.userId)) return;
+
+  const maxBytes = maxTelegramImageBytes(env);
+  if (job.declaredSizeBytes && job.declaredSizeBytes > maxBytes) {
+    await sendTelegramMessage(env, job.chatId, "图片超过识图大小限制，请压缩后重新发送。", {
+      reply_to_message_id: job.sourceMessageId,
+    });
+    return;
+  }
+
+  try {
+    const file = await telegramApi<TelegramFileInfo>(env, "getFile", { file_id: job.fileId });
+    if (!file.file_path) throw new Error("Telegram did not return a file path.");
+    if (file.file_size && file.file_size > maxBytes) {
+      throw new Error("Image exceeds the configured vision size limit.");
+    }
+
+    const imageResponse = await fetch(telegramFileUrl(env, file.file_path));
+    if (!imageResponse.ok) throw new Error(`Telegram image download failed with HTTP ${imageResponse.status}.`);
+
+    const contentLength = Number(imageResponse.headers.get("content-length"));
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      throw new Error("Image exceeds the configured vision size limit.");
+    }
+
+    const buffer = await imageResponse.arrayBuffer();
+    if (buffer.byteLength > maxBytes) throw new Error("Image exceeds the configured vision size limit.");
+    if (buffer.byteLength === 0) throw new Error("Telegram returned an empty image.");
+
+    const bytes = new Uint8Array(buffer);
+    const mimeType = detectImageMime(
+      bytes,
+      imageResponse.headers.get("content-type") ?? job.mimeType,
+    );
+    if (!mimeType) throw new Error("Unsupported or invalid image format.");
+
+    const books = await recognizeBooksFromImage(env, bytes, mimeType, job.caption);
+    if (books.length === 0) {
+      await sendTelegramMessage(
+        env,
+        job.chatId,
+        "这张图片里没能可靠识别出书名。可以换一张更清晰的封面，或者直接发送书名。",
+        { reply_to_message_id: job.sourceMessageId },
+      );
+      return;
+    }
+
+    if (shouldAutoSelectRecognition(books)) {
+      const book = books[0];
+      const request: BookRequest = {
+        query: book.title,
+        author: book.author || undefined,
+        language: explicitLanguage(job.caption),
+        preferredFormat: explicitFormat(job.caption),
+      };
+      await createTelegramBookTask({
+        env,
+        chatId: job.chatId,
+        userId: job.userId,
+        sourceMessageId: job.sourceMessageId,
+        request,
+      });
+      await sendTelegramMessage(
+        env,
+        job.chatId,
+        `识别到《${book.title}》${book.author ? `（${book.author}）` : ""}，开始查找并发送到 Kindle。`,
+        { reply_to_message_id: job.sourceMessageId },
+      );
+      return;
+    }
+
+    const record = await new TelegramImageChoiceRepository(env.DB).create({
+      chatId: job.chatId,
+      userId: job.userId,
+      sourceMessageId: job.sourceMessageId,
+      choices: books,
+    });
+    await sendTelegramMessage(
+      env,
+      job.chatId,
+      books.length === 1
+        ? "识别到了一个可能的书名，但把握不够高，请确认："
+        : "图片里识别到多本书，请选择要发送到 Kindle 的一本：",
+      {
+        reply_to_message_id: job.sourceMessageId,
+        reply_markup: imageChoiceKeyboard(record),
+      },
+    );
+  } catch (error) {
+    console.error("Telegram image recognition failed", job.sourceMessageId, error);
+    await sendTelegramMessage(
+      env,
+      job.chatId,
+      "图片识别暂时失败。请稍后重发图片，或直接发送书名。",
+      { reply_to_message_id: job.sourceMessageId },
+    );
+  }
+}
+
 export function isTelegramConfigured(env: Env): boolean {
   return Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_WEBHOOK_SECRET);
 }
 
 export async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
-  if (!isTelegramConfigured(env)) {
-    return new Response("telegram_not_configured", { status: 503 });
-  }
-
-  if (request.method !== "POST") {
-    return new Response("method_not_allowed", { status: 405 });
-  }
+  if (!isTelegramConfigured(env)) return new Response("telegram_not_configured", { status: 503 });
+  if (request.method !== "POST") return new Response("method_not_allowed", { status: 405 });
 
   const secret = request.headers.get("x-telegram-bot-api-secret-token");
   if (!secret || secret !== env.TELEGRAM_WEBHOOK_SECRET) {
