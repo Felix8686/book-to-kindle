@@ -2,6 +2,11 @@ import type { BookRequest, Env, TaskQueueMessage } from "./domain";
 import { GmailDelivery, isGmailConfigured } from "./adapters/gmail";
 import { GutendexSource } from "./adapters/gutendex";
 import { TaskRepository } from "./repository";
+import {
+  handleTelegramWebhook,
+  isTelegramConfigured,
+  notifyTelegramTaskState,
+} from "./telegram";
 import { processTask } from "./workflow";
 
 function json(data: unknown, init: ResponseInit = {}): Response {
@@ -51,6 +56,10 @@ async function readJson(request: Request): Promise<Record<string, unknown> | nul
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
+  if (url.pathname === "/telegram/webhook") {
+    return handleTelegramWebhook(request, env);
+  }
+
   if (request.method === "GET" && url.pathname === "/health") {
     return json({
       ok: true,
@@ -58,6 +67,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       environment: env.APP_ENV ?? "unknown",
       source: "gutendex",
       delivery: isGmailConfigured(env) && env.KINDLE_EMAIL ? "gmail" : "not_configured",
+      telegram: isTelegramConfigured(env) ? "configured" : "not_configured",
     });
   }
 
@@ -134,17 +144,31 @@ export default {
     const delivery = isGmailConfigured(env) ? new GmailDelivery(env) : undefined;
 
     for (const message of batch.messages) {
+      let processingError: unknown;
+
       try {
         await processTask(message.body.taskId, {
           env,
           sources: sources(),
           delivery,
         });
-        message.ack();
       } catch (error) {
+        processingError = error;
         console.error("Queue task failed", message.body.taskId, error);
-        message.retry();
       }
+
+      try {
+        await notifyTelegramTaskState(message.body.taskId, env);
+      } catch (notificationError) {
+        console.error(
+          "Telegram task notification failed",
+          message.body.taskId,
+          notificationError,
+        );
+      }
+
+      if (processingError) message.retry();
+      else message.ack();
     }
   },
 };
