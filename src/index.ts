@@ -6,6 +6,7 @@ import {
   handleTelegramWebhook,
   isTelegramConfigured,
   notifyTelegramTaskState,
+  processTelegramImageMessage,
 } from "./telegram";
 import { processTask } from "./workflow";
 
@@ -68,6 +69,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       source: "gutendex",
       delivery: isGmailConfigured(env) && env.KINDLE_EMAIL ? "gmail" : "not_configured",
       telegram: isTelegramConfigured(env) ? "configured" : "not_configured",
+      vision: env.AI ? "workers_ai" : "not_configured",
     });
   }
 
@@ -90,7 +92,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
     const id = crypto.randomUUID();
     await repo.create(id, bookRequest);
-    await env.TASK_QUEUE.send({ taskId: id });
+    await env.TASK_QUEUE.send({ kind: "book", taskId: id });
 
     return json({ id, status: "queued" }, { status: 202 });
   }
@@ -123,7 +125,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       selectedCandidate: selected,
       errorMessage: null,
     });
-    await env.TASK_QUEUE.send({ taskId: task.id });
+    await env.TASK_QUEUE.send({ kind: "book", taskId: task.id });
 
     return json({ id: task.id, status: "queued", selectedCandidate: selected }, { status: 202 });
   }
@@ -144,27 +146,36 @@ export default {
     const delivery = isGmailConfigured(env) ? new GmailDelivery(env) : undefined;
 
     for (const message of batch.messages) {
+      if (message.body.kind === "telegram_image") {
+        try {
+          await processTelegramImageMessage(message.body, env);
+        } catch (error) {
+          console.error("Telegram image queue job failed", message.body.sourceMessageId, error);
+        }
+        // Vision jobs are intentionally not auto-retried: repeating AI inference can
+        // waste the free quota and create duplicate buttons/tasks. The user can resend.
+        message.ack();
+        continue;
+      }
+
+      const taskId = message.body.taskId;
       let processingError: unknown;
 
       try {
-        await processTask(message.body.taskId, {
+        await processTask(taskId, {
           env,
           sources: sources(),
           delivery,
         });
       } catch (error) {
         processingError = error;
-        console.error("Queue task failed", message.body.taskId, error);
+        console.error("Queue task failed", taskId, error);
       }
 
       try {
-        await notifyTelegramTaskState(message.body.taskId, env);
+        await notifyTelegramTaskState(taskId, env);
       } catch (notificationError) {
-        console.error(
-          "Telegram task notification failed",
-          message.body.taskId,
-          notificationError,
-        );
+        console.error("Telegram task notification failed", taskId, notificationError);
       }
 
       if (processingError) message.retry();
