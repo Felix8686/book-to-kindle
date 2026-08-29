@@ -1,9 +1,14 @@
-import type { DeliveryAdapter, Env } from "../domain";
+import type { DeliveryAdapter, DeliveryReceipt, Env } from "../domain";
 
 interface TokenResponse {
   access_token?: string;
   error?: string;
   error_description?: string;
+}
+
+interface GmailSendResponse {
+  id?: string;
+  threadId?: string;
 }
 
 function encodeHeader(value: string): string {
@@ -125,7 +130,7 @@ export class GmailDelivery implements DeliveryAdapter {
     task: Parameters<DeliveryAdapter["deliver"]>[0]["task"];
     object: R2ObjectBody;
     kindleEmail: string;
-  }): Promise<void> {
+  }): Promise<DeliveryReceipt> {
     if (!this.env.GMAIL_FROM_EMAIL) throw new Error("GMAIL_FROM_EMAIL is not configured.");
     const selected = input.task.selectedCandidate;
     if (!selected) throw new Error("Task has no selected candidate to deliver.");
@@ -157,5 +162,19 @@ export class GmailDelivery implements DeliveryAdapter {
       const detail = (await response.text()).slice(0, 1000);
       throw new Error(`Gmail delivery failed with HTTP ${response.status}: ${detail}`);
     }
+
+    let data: GmailSendResponse = {};
+    try {
+      data = (await response.json()) as GmailSendResponse;
+    } catch {
+      // A successful Gmail HTTP response is enough to treat the message as accepted.
+    }
+
+    return {
+      provider: this.name,
+      acceptedAt: new Date().toISOString(),
+      messageId: data.id,
+      threadId: data.threadId,
+    };
   }
 }
