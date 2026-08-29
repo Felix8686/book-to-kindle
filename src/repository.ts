@@ -30,7 +30,7 @@ export class TaskRepository {
   async get(id: string): Promise<TaskRecord | null> {
     const row = await this.db
       .prepare(
-        `SELECT id, status, request_json, selected_candidate_json, storage_key,
+        `SELECT id, status, request_json, candidates_json, selected_candidate_json, storage_key,
                 error_message, created_at, updated_at
          FROM tasks WHERE id = ?1`,
       )
@@ -43,6 +43,7 @@ export class TaskRepository {
       id: String(row.id),
       status: String(row.status) as TaskStatus,
       request: parseJson<BookRequest>(row.request_json)!,
+      candidates: parseJson<BookCandidate[]>(row.candidates_json),
       selectedCandidate: parseJson<BookCandidate>(row.selected_candidate_json),
       storageKey: row.storage_key ? String(row.storage_key) : undefined,
       errorMessage: row.error_message ? String(row.error_message) : undefined,
@@ -55,6 +56,7 @@ export class TaskRepository {
     id: string,
     patch: {
       status?: TaskStatus;
+      candidates?: BookCandidate[] | null;
       selectedCandidate?: BookCandidate | null;
       storageKey?: string | null;
       errorMessage?: string | null;
@@ -64,6 +66,8 @@ export class TaskRepository {
     if (!current) throw new Error(`Task not found: ${id}`);
 
     const status = patch.status ?? current.status;
+    const candidates =
+      patch.candidates === undefined ? current.candidates : patch.candidates ?? undefined;
     const candidate =
       patch.selectedCandidate === undefined
         ? current.selectedCandidate
@@ -77,15 +81,17 @@ export class TaskRepository {
       .prepare(
         `UPDATE tasks
          SET status = ?2,
-             selected_candidate_json = ?3,
-             storage_key = ?4,
-             error_message = ?5,
-             updated_at = ?6
+             candidates_json = ?3,
+             selected_candidate_json = ?4,
+             storage_key = ?5,
+             error_message = ?6,
+             updated_at = ?7
          WHERE id = ?1`,
       )
       .bind(
         id,
         status,
+        candidates ? JSON.stringify(candidates) : null,
         candidate ? JSON.stringify(candidate) : null,
         storageKey ?? null,
         errorMessage ?? null,
