@@ -198,7 +198,7 @@ export async function handleTelegramSettingsWebhook(
     return new Response("ok");
   }
 
-  if (requestedLanguage === "invalid") {
+  if (requestedLanguage === null || requestedLanguage === "invalid") {
     await sendTelegramMessage(
       env,
       String(message.chat.id),
