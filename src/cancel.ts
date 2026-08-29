@@ -250,16 +250,20 @@ function helpText(): string {
   return [
     "Book to Kindle 已连接。",
     "",
-    "直接发送书名或书籍图片即可创建任务。",
+    "直接发送书名或书籍图片即可创建任务。新用户默认中文版本优先、EPUB 优先。",
     "",
     "命令：",
     "/send <书名>  创建任务",
     "/status  查看最近任务",
+    "/settings  查看默认书籍设置",
+    "/language zh  默认中文优先",
+    "/language en  默认英文优先",
     "/cancel  取消最近仍可取消的任务",
     "/cancel <task-id>  取消指定任务",
     "/whoami  查看你的 Telegram user ID",
     "/help  查看帮助",
     "",
+    "单次消息里的“中文/英文”只覆盖当前任务，不修改默认设置。",
     "也可以直接发送“取消”或“撤回”。",
     "注意：一旦 Gmail 已经开始投递，就无法保证撤回。",
   ].join("\n");
@@ -284,10 +288,6 @@ function cancellationMessage(result: CancelOutcome): string {
   }
 }
 
-/**
- * Intercepts only Telegram control commands that need cancellation-aware behavior.
- * Returns null for ordinary Telegram updates so the main Telegram adapter can handle them.
- */
 export async function handleTelegramControlWebhook(
   request: Request,
   env: Env,
