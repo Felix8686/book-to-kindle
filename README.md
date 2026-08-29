@@ -1,107 +1,104 @@
 # Book to Kindle
 
-> Say what you want to read. Let the workflow deliver it to your Kindle.
+> Say it, type it, or show the cover. Let the workflow deliver the book to Kindle.
 
-Book to Kindle is a lightweight, Cloudflare-first workflow for sending ebooks to Kindle with as little manual work as possible. The same core codebase is designed to run locally or on Cloudflare, while the Cloudflare deployment can stay available even when the user's PC is turned off.
+Book to Kindle is a lightweight, Cloudflare-first workflow for sending ebooks to Kindle with minimal manual work. The same core workflow can run locally or on Cloudflare; the Cloudflare deployment stays available even when the user's PC and Hermes are offline.
 
-## Goals
+## What it does
 
-- **One intent, one workflow** — accept a book request from Telegram, Hermes, another AI agent, or a plain HTTP client.
-- **Local or cloud** — use the same core workflow in local development and Cloudflare deployment.
-- **Cloudflare Free friendly** — keep the always-on path inside Workers, Queues, D1 and R2; move heavyweight conversion to optional local adapters.
-- **Asynchronous by default** — HTTP and chat entrypoints enqueue work instead of blocking while files are fetched or delivered.
-- **Provider-neutral** — discovery/download, delivery and user entrypoints are adapters rather than hard-coded into orchestration.
-- **Legal-source first** — bundled providers only target content the user is authorized to obtain.
+You can currently request a book through:
 
-## Architecture
+- Telegram text;
+- Telegram book-cover/photo/screenshot;
+- the HTTP API;
+- future adapters such as Hermes or a share sheet.
+
+The normal cloud path is:
 
 ```text
-                +-------------------+
-Telegram ------>| Telegram adapter  |
-Hermes -------->| HTTP/API adapter  |
-Other clients ->|                   |
-                +---------+---------+
-                          |
-                          v
-                  Cloudflare Worker
-                          |
-                 +--------+--------+
-                 |                 |
-                 v                 v
-                D1              Queue
-                                   |
-                                   v
-                            Source Adapter
-                              (Gutendex)
-                                   |
-                                   v
-                                  R2
-                                   |
-                                   v
-                           Delivery Adapter
-                             (Gmail API)
-                                   |
-                                   v
-                                Kindle
-
-Optional local enhancement node
-(Shelfmark / CWA / Calibre)
+Telegram text -----------------------+
+                                      |
+Telegram image -> Queue -> Workers AI+--> BookRequest
+                                      |
+HTTP / future Hermes ----------------+
+                                      |
+                                      v
+                                     D1
+                                      |
+                                      v
+                                    Queue
+                                      |
+                                      v
+                           Gutendex / Project Gutenberg
+                                      |
+                                      v
+                                     R2
+                                      |
+                                      v
+                                  Gmail API
+                                      |
+                                      v
+                                    Kindle
 ```
 
-Telegram talks directly to the Cloudflare Worker. Hermes is optional and is not required for the workflow to stay usable while the PC is off.
+Heavy repair/conversion tools such as Shelfmark, Calibre or CWA are deliberately excluded from the Cloudflare core path and remain optional future local enhancements.
 
 ## Current status
 
-**v0.3.0 — Telegram user entrypoint**
+**v0.4.0 — Telegram image recognition**
 
 Implemented:
 
-- Cloudflare Worker HTTP API
-- D1-backed task state
-- Queue-based asynchronous processing
-- R2 temporary ebook staging
-- deterministic candidate ranking
-- ambiguity protection with persisted candidate lists
-- built-in Gutendex / Project Gutenberg public-domain source adapter
-- streaming file-size guardrail and EPUB/PDF signature validation
-- Gmail OAuth Send-to-Kindle delivery
-- persisted Gmail delivery receipts
-- `delivery_unknown` duplicate-send protection
-- **Telegram Bot webhook entrypoint**
-- Telegram webhook secret validation
-- Telegram user allowlist
-- direct-title and natural-language requests
-- `/send`, `/status`, `/whoami`, `/help`
-- Telegram inline buttons for edition selection
-- Telegram completion/error notifications
-- local execution through Wrangler
-- GitHub Actions TypeScript validation
+- Cloudflare Worker HTTP API;
+- D1 task state;
+- Queue-based asynchronous processing;
+- R2 temporary ebook staging;
+- Gutendex / Project Gutenberg public-domain source adapter;
+- deterministic edition ranking and ambiguity protection;
+- Gmail OAuth Send-to-Kindle delivery;
+- Gmail delivery receipts;
+- conservative `delivery_unknown` duplicate-send protection;
+- Telegram webhook with secret validation;
+- Telegram user allowlist and private-chat restriction;
+- direct-title and lightweight natural-language requests;
+- `/send`, `/status`, `/whoami`, `/help`;
+- Telegram inline buttons for source-edition selection;
+- Telegram completion/error notifications;
+- **Telegram photo and image-document input**;
+- **Cloudflare Workers AI vision recognition**;
+- automatic book-title/author extraction from clear covers;
+- inline book-selection buttons for multi-book or uncertain images;
+- image caption preferences such as `PDF`, `中文`, `英文`;
+- JPEG/PNG/WebP validation and strict image-size limits;
+- GitHub Actions TypeScript validation.
 
 Still planned:
 
-- Hermes Skill/MCP adapter
-- browser/share-sheet entry point
-- optional Shelfmark/CWA/Calibre local enhancement node
-- explicit user-controlled retry for uncertain deliveries
-- additional authorized/public-domain source adapters
+- Hermes Skill/MCP adapter;
+- browser/share-sheet entrypoint;
+- additional authorized/public-domain source adapters;
+- explicit user-controlled retry for uncertain deliveries;
+- optional Shelfmark/CWA/Calibre enhancement node.
 
 ## Telegram usage
 
-After Telegram is configured, the normal user experience is simply:
+### Text
 
 ```text
 把《Pride and Prejudice》发到 Kindle
 ```
 
-or:
+or simply:
 
 ```text
 Pride and Prejudice
 ```
 
-The bot acknowledges the request, creates the same core task used by the HTTP API, and later reports the result.
+Prefer PDF:
 
-If multiple plausible editions are found, Telegram displays inline buttons and the selected candidate resumes the **same task**.
+```text
+《The Little Prince》 PDF
+```
 
 Useful commands:
 
@@ -112,9 +109,81 @@ Useful commands:
 /help
 ```
 
-EPUB is the default format preference. Add `PDF` to the request to prefer PDF.
+### Image
 
-Full setup: [`docs/TELEGRAM.md`](docs/TELEGRAM.md).
+Send the bot a clear:
+
+- book cover;
+- photo of a physical book;
+- reading-app/bookstore screenshot;
+- screenshot containing several books.
+
+For a clear single cover, the bot can continue automatically:
+
+```text
+收到图片，正在识别书名和作者……
+
+识别到《Pride and Prejudice》（Jane Austen），开始查找并发送到 Kindle。
+```
+
+If the image contains several books or confidence is low, the bot sends inline buttons and waits for your selection before creating the normal book task.
+
+You can add a caption such as:
+
+```text
+PDF
+```
+
+or:
+
+```text
+英文 EPUB
+```
+
+Those preferences survive the recognition/selection step.
+
+Full Telegram setup: [`docs/TELEGRAM.md`](docs/TELEGRAM.md).
+
+## Why image recognition is asynchronous
+
+The Telegram webhook does not run vision inference itself. It only validates the request and enqueues a lightweight `telegram_image` job.
+
+The Queue consumer then downloads the bounded image and calls Cloudflare Workers AI. This keeps the webhook fast and preserves the Cloudflare-first architecture.
+
+Current vision model:
+
+```text
+@cf/meta/llama-3.2-11b-vision-instruct
+```
+
+The Worker uses an `AI` binding configured in `wrangler.toml`. Before first production use, the Cloudflare account must accept the model's Meta license/AUP once.
+
+## Image safety / resource guardrails
+
+Default:
+
+```toml
+MAX_TELEGRAM_IMAGE_BYTES = "4194304"
+```
+
+This is 4 MiB. Code also enforces a hard 6 MiB ceiling.
+
+Supported image formats:
+
+- JPEG;
+- PNG;
+- WebP.
+
+The image path:
+
+1. requires an authorized Telegram user;
+2. checks Telegram-declared and downloaded size;
+3. validates the actual file signature;
+4. performs Workers AI inference;
+5. does **not** persist the original image in R2 or D1;
+6. does not automatically retry a failed vision job, avoiding duplicate inference cost/buttons/tasks.
+
+Workers AI has a free daily allocation, so this path is designed for lightweight personal use rather than bulk image processing.
 
 ## HTTP API
 
@@ -142,13 +211,13 @@ Authorization: Bearer <API_TOKEN>
 
 Important states:
 
-- `delivered` — Gmail accepted the message
-- `delivery_unknown` — Gmail delivery started but the final outcome could not be confirmed; automatic resend is blocked
-- `needs_selection` — several plausible editions were found
-- `needs_source` — no compatible bundled source was found
-- `failed` — processing failed before delivery was known to have started
+- `delivered` — Gmail accepted the message;
+- `delivery_unknown` — delivery started but the final outcome is unknown, so automatic resend is blocked;
+- `needs_selection` — source edition needs confirmation;
+- `needs_source` — no compatible bundled source was found;
+- `failed` — processing failed before delivery was known to have started.
 
-### Resolve an ambiguous match
+### Resolve source ambiguity
 
 ```http
 POST /api/v1/tasks/<id>/select
@@ -160,31 +229,37 @@ Content-Type: application/json
 }
 ```
 
-Telegram users do not need to call this endpoint manually; the inline selection buttons use the same state transition internally.
+Telegram users normally use inline buttons instead of this endpoint.
 
-### Health check
+### Health
 
 ```http
 GET /health
 ```
 
-The health response reports source, Gmail and Telegram configuration state without exposing secrets.
+A fully configured v0.4 deployment reports source/delivery/Telegram status and:
 
-## Telegram security model
+```json
+{
+  "vision": "workers_ai"
+}
+```
 
-The Telegram webhook endpoint is:
+## Telegram security
+
+The webhook endpoint is:
 
 ```text
 POST /telegram/webhook
 ```
 
-It does **not** use the normal `API_TOKEN`. Instead it verifies Telegram's webhook secret header:
+It verifies Telegram's:
 
 ```text
 X-Telegram-Bot-Api-Secret-Token
 ```
 
-Required Telegram configuration:
+Required Telegram secrets:
 
 ```text
 TELEGRAM_BOT_TOKEN
@@ -195,10 +270,11 @@ TELEGRAM_ALLOWED_USER_IDS
 Security defaults:
 
 - only private chats are accepted;
-- `/whoami` is available before allowlist setup so the owner can discover their numeric Telegram user ID;
-- task creation is denied until an explicit allowlist exists;
-- candidate selection callbacks must match both the original Telegram user and original chat;
-- Telegram task/chat mapping is stored separately from the core task model.
+- `/whoami` remains available before allowlist setup;
+- task/image processing is denied until an explicit allowlist exists;
+- source and image selection callbacks verify the original user and chat;
+- Telegram metadata lives outside the core task model;
+- Telegram file URLs are generated internally from Telegram `file_id` values.
 
 ## Local development
 
@@ -227,87 +303,75 @@ TELEGRAM_WEBHOOK_SECRET=...
 TELEGRAM_ALLOWED_USER_IDS=123456789
 ```
 
-Telegram itself requires a public HTTPS webhook URL, so local Telegram webhook testing needs a secure tunnel or temporary deployed Worker. The normal HTTP API remains locally testable without a tunnel.
+Telegram requires a public HTTPS webhook, so live Telegram testing needs a secure tunnel or a deployed Worker.
 
 ## Cloudflare deployment
 
-1. Create D1, R2, task queue and dead-letter queue.
-2. Replace the D1 placeholder ID in `wrangler.toml`.
-3. Store credentials with Wrangler secrets.
-4. Apply all migrations, including `0004_telegram_entry.sql`.
-5. Deploy.
-6. Register the Telegram webhook.
+The repository uses:
+
+- Workers;
+- Workers AI;
+- D1;
+- R2;
+- Queues.
+
+Apply all migrations before deploying:
+
+```text
+0001_init.sql
+0002_candidates.sql
+0003_delivery_receipt.sql
+0004_telegram_entry.sql
+0005_telegram_image_choices.sql
+```
+
+Then:
 
 ```bash
 npm install
+npm run typecheck
 npm run db:migrate:remote
 npm run deploy
 ```
 
+For image input, also accept the Meta vision-model license/AUP once on the Cloudflare account before testing.
+
 Detailed deployment: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
-Telegram setup: [`docs/TELEGRAM.md`](docs/TELEGRAM.md).
+Gmail OAuth: [`docs/GMAIL_OAUTH.md`](docs/GMAIL_OAUTH.md).
 
-Gmail OAuth setup: [`docs/GMAIL_OAUTH.md`](docs/GMAIL_OAUTH.md).
+Telegram + image setup: [`docs/TELEGRAM.md`](docs/TELEGRAM.md).
 
-## Cloudflare Free design rules
+## Cloudflare-first design rules
 
-1. Keep HTTP/webhook request handlers short and enqueue long-running work.
-2. Store ebook bytes in R2, never D1.
-3. Put only task metadata/status and lightweight entrypoint mappings in D1.
-4. Avoid Docker/Calibre/native binaries in the Cloudflare core path.
-5. Stream downloads and delivery rather than buffering entire books when possible.
-6. Reject files above the configured cloud-path threshold.
-7. Delete temporary R2 objects after confirmed delivery; cleanup failure must not turn a successful delivery into a failed task.
-
-The default cloud-path threshold is currently **20 MiB**.
-
-## Built-in source
-
-The first bundled provider is **Gutendex**, an API over Project Gutenberg metadata. The adapter:
-
-- requests entries marked `copyright=false` by Gutendex;
-- supports title/author search and language filtering;
-- exposes EPUB/PDF candidates;
-- prefers Project Gutenberg's standard no-images EPUB variant for the cloud path;
-- only follows HTTPS downloads hosted under `gutenberg.org`;
-- validates EPUB/PDF file signatures before R2 staging.
-
-Copyright status varies by jurisdiction. Users remain responsible for ensuring they are allowed to obtain and use a specific file.
-
-## Gmail / Kindle delivery
-
-The delivery adapter uses Gmail OAuth with the `gmail.send` scope. It refreshes a short-lived access token when needed, creates a MIME message, streams the staged ebook into it, and sends it through Gmail's media-upload endpoint.
-
-Required secrets:
-
-```text
-KINDLE_EMAIL
-GMAIL_CLIENT_ID
-GMAIL_CLIENT_SECRET
-GMAIL_REFRESH_TOKEN
-GMAIL_FROM_EMAIL
-```
-
-The Gmail sender must also be allowed by the user's Amazon Send to Kindle settings.
+1. Keep HTTP/webhook handlers short.
+2. Put network-heavy/AI work behind Queue.
+3. Store ebook bytes in R2, never D1.
+4. Keep D1 to lightweight task/entry/recognition metadata.
+5. Do not persist source images unnecessarily.
+6. Keep strict ebook/image size guardrails.
+7. Avoid Docker, Calibre and native binaries in the cloud core path.
+8. Do not blindly resend after an uncertain Gmail delivery.
+9. Keep Hermes optional rather than a required cloud relay.
 
 ## Repository layout
 
 ```text
 src/
-  index.ts                  Worker entry point + HTTP API + queue consumer
-  telegram.ts               Telegram webhook, commands, buttons, notifications
-  domain.ts                 shared request/task/adapter types
-  repository.ts             D1 task repository
-  workflow.ts               platform-neutral orchestration
+  index.ts                  Worker/API/Queue entrypoint
+  domain.ts                 shared types and queue message contracts
+  repository.ts             core D1 task repository
+  workflow.ts               book workflow orchestration
+  telegram.ts               Telegram text/image adapter
   adapters/
-    gutendex.ts              public-domain search/download adapter
-    gmail.ts                 Gmail Send-to-Kindle delivery adapter
+    gutendex.ts              public-domain discovery/download
+    gmail.ts                 Gmail Send-to-Kindle delivery
 migrations/
   0001_init.sql
   0002_candidates.sql
   0003_delivery_receipt.sql
   0004_telegram_entry.sql
+  0005_telegram_image_choices.sql
 docs/
   ARCHITECTURE.md
   DEPLOYMENT.md
@@ -320,46 +384,22 @@ CHANGELOG.md
 ## Roadmap
 
 ### v0.1 — Core workflow
-- task API
-- D1 state
-- Queue execution
-- R2 staging
+Task API, D1, Queue and R2 staging.
 
-### v0.2 — Real cloud path
-- Gutendex / Project Gutenberg adapter
-- candidate confirmation endpoint
-- Gmail OAuth delivery
-- streaming upload and file validation
-- delivery receipts and duplicate-send protection
+### v0.2 — Real cloud delivery
+Public-domain source, Gmail delivery, receipts and delivery safety.
 
-### v0.3 — User entrypoint
-- Telegram webhook
-- natural-language book requests
-- chat status notifications
-- inline ambiguity confirmation
-- Telegram user authorization
+### v0.3 — Telegram text entry
+Direct Telegram requests, selection buttons and notifications.
 
-### v0.4 — Additional entrypoints and source intelligence
-- Hermes Skill/MCP bridge
-- browser/share-sheet bridge
-- additional authorized/public-domain providers
-- stronger metadata matching
+### v0.4 — Telegram vision entry
+Book covers/screenshots -> Workers AI -> normal book workflow.
 
-### v0.5 — Optional local enhancement
-- Shelfmark adapter
-- Calibre/CWA processing node
-- repair/convert fallback for files Cloudflare should not process
-
-## Security
-
-- Secrets belong in Wrangler secrets / `.dev.vars`, never Git.
-- HTTP task APIs require a bearer token except `/health`.
-- Telegram webhook calls require the Telegram webhook secret header.
-- Telegram task creation requires an explicit user allowlist.
-- Bundled download adapters use explicit host allowlists.
-- File type, signature and size are validated before staging.
-- Temporary files are removed after confirmed delivery.
-- Automatic resend is blocked when delivery outcome is uncertain.
+### Next
+- Hermes adapter;
+- more authorized/public-domain sources;
+- browser/share-sheet entry;
+- optional local repair/conversion node.
 
 ## License
 
