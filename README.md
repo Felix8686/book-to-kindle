@@ -61,7 +61,9 @@ Implemented:
 - Telegram webhook with secret validation;
 - Telegram user allowlist and private-chat restriction;
 - direct-title and lightweight natural-language requests;
-- `/send`, `/status`, `/whoami`, `/help`;
+- `/send`, `/status`, `/cancel`, `/whoami`, `/help`;
+- Chinese `取消` / `撤回` cancellation commands;
+- authenticated HTTP cancellation endpoint;
 - Telegram inline buttons for source-edition selection;
 - Telegram completion/error notifications;
 - **Telegram photo and image-document input**;
@@ -105,9 +107,25 @@ Useful commands:
 ```text
 /send <书名>
 /status
+/cancel
+/cancel <task-id>
 /whoami
 /help
 ```
+
+You can also send:
+
+```text
+取消
+```
+
+or:
+
+```text
+撤回
+```
+
+`/cancel` targets the most recent Telegram-linked task that is still safely cancellable. A task cannot be truthfully recalled once Gmail delivery has already started.
 
 ### Image
 
@@ -143,6 +161,46 @@ or:
 Those preferences survive the recognition/selection step.
 
 Full Telegram setup: [`docs/TELEGRAM.md`](docs/TELEGRAM.md).
+
+## Cancellation semantics
+
+Cancellation is intentionally conservative.
+
+These states can still be cancelled:
+
+```text
+queued
+searching
+needs_source
+needs_selection
+downloading
+staged
+```
+
+A successful cancellation becomes:
+
+```text
+cancelled
+```
+
+Once the task has entered any of these states, the service will not claim it can withdraw the document:
+
+```text
+delivering
+delivery_unknown
+delivered
+```
+
+The Queue workflow re-checks cancellation around search, download, R2 staging, and the final Gmail boundary. If cancellation wins while a file is being staged, the temporary R2 object is deleted best-effort and delivery does not continue.
+
+HTTP clients can use:
+
+```http
+POST /api/v1/tasks/<id>/cancel
+Authorization: Bearer <API_TOKEN>
+```
+
+Detailed behavior: [`docs/CANCELLATION.md`](docs/CANCELLATION.md).
 
 ## Why image recognition is asynchronous
 
@@ -211,11 +269,21 @@ Authorization: Bearer <API_TOKEN>
 
 Important states:
 
+- `cancelled` — the user cancelled before Gmail delivery began;
 - `delivered` — Gmail accepted the message;
 - `delivery_unknown` — delivery started but the final outcome is unknown, so automatic resend is blocked;
 - `needs_selection` — source edition needs confirmation;
 - `needs_source` — no compatible bundled source was found;
 - `failed` — processing failed before delivery was known to have started.
+
+### Cancel a task
+
+```http
+POST /api/v1/tasks/<id>/cancel
+Authorization: Bearer <API_TOKEN>
+```
+
+The endpoint returns a conflict if Gmail delivery has already begun or completed.
 
 ### Resolve source ambiguity
 
@@ -273,6 +341,7 @@ Security defaults:
 - `/whoami` remains available before allowlist setup;
 - task/image processing is denied until an explicit allowlist exists;
 - source and image selection callbacks verify the original user and chat;
+- targeted `/cancel <task-id>` verifies that the task belongs to the same Telegram user;
 - Telegram metadata lives outside the core task model;
 - Telegram file URLs are generated internally from Telegram `file_id` values.
 
@@ -322,8 +391,11 @@ Apply all migrations before deploying:
 0002_candidates.sql
 0003_delivery_receipt.sql
 0004_telegram_entry.sql
+0005_telegram_update_idempotency.sql
 0006_telegram_image_choices.sql
 ```
+
+Cancellation uses the existing free-form `tasks.status` column and therefore needs no extra migration.
 
 Then:
 
@@ -342,6 +414,8 @@ Gmail OAuth: [`docs/GMAIL_OAUTH.md`](docs/GMAIL_OAUTH.md).
 
 Telegram + image setup: [`docs/TELEGRAM.md`](docs/TELEGRAM.md).
 
+Cancellation behavior: [`docs/CANCELLATION.md`](docs/CANCELLATION.md).
+
 ## Cloudflare-first design rules
 
 1. Keep HTTP/webhook handlers short.
@@ -352,7 +426,8 @@ Telegram + image setup: [`docs/TELEGRAM.md`](docs/TELEGRAM.md).
 6. Keep strict ebook/image size guardrails.
 7. Avoid Docker, Calibre and native binaries in the cloud core path.
 8. Do not blindly resend after an uncertain Gmail delivery.
-9. Keep Hermes optional rather than a required cloud relay.
+9. Do not pretend that an already-started Gmail/Kindle delivery can be recalled.
+10. Keep Hermes optional rather than a required cloud relay.
 
 ## Repository layout
 
@@ -363,6 +438,7 @@ src/
   repository.ts             core D1 task repository
   workflow.ts               book workflow orchestration
   telegram.ts               Telegram text/image adapter
+  cancel.ts                 Telegram/HTTP cancellation controls
   adapters/
     gutendex.ts              public-domain discovery/download
     gmail.ts                 Gmail Send-to-Kindle delivery
@@ -371,9 +447,11 @@ migrations/
   0002_candidates.sql
   0003_delivery_receipt.sql
   0004_telegram_entry.sql
+  0005_telegram_update_idempotency.sql
   0006_telegram_image_choices.sql
 docs/
   ARCHITECTURE.md
+  CANCELLATION.md
   DEPLOYMENT.md
   GMAIL_OAUTH.md
   TELEGRAM.md
@@ -393,7 +471,7 @@ Public-domain source, Gmail delivery, receipts and delivery safety.
 Direct Telegram requests, selection buttons and notifications.
 
 ### v0.4 — Telegram vision entry
-Book covers/screenshots -> Workers AI -> normal book workflow.
+Book covers/screenshots -> Workers AI -> normal book workflow, plus safe task cancellation before Gmail delivery begins.
 
 ### Next
 - Hermes adapter;
