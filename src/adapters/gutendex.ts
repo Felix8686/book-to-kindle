@@ -48,6 +48,16 @@ function formatsFor(book: GutendexBook): Array<{ format: "epub" | "pdf"; content
   return output;
 }
 
+function isAllowedDownloadUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    return url.protocol === "https:" && (hostname === "gutenberg.org" || hostname.endsWith(".gutenberg.org"));
+  } catch {
+    return false;
+  }
+}
+
 function limitedStream(
   body: ReadableStream<Uint8Array>,
   maxBytes?: number,
@@ -96,6 +106,7 @@ export class GutendexSource implements SourceAdapter {
       const author = book.authors.map((item) => item.name).filter(Boolean).join(", ") || undefined;
 
       for (const item of formatsFor(book)) {
+        if (!isAllowedDownloadUrl(item.url)) continue;
         const sourceRef: SourceRef = {
           url: item.url,
           contentType: item.contentType,
@@ -126,6 +137,10 @@ export class GutendexSource implements SourceAdapter {
     sizeBytes?: number;
   }> {
     const ref = JSON.parse(candidate.sourceRef) as SourceRef;
+    if (!isAllowedDownloadUrl(ref.url)) {
+      throw new Error("Rejected download URL outside the Project Gutenberg allowlist.");
+    }
+
     const response = await fetch(ref.url, {
       headers: { accept: ref.contentType },
       redirect: "follow",
@@ -135,9 +150,16 @@ export class GutendexSource implements SourceAdapter {
       throw new Error(`Gutendex download failed with HTTP ${response.status}.`);
     }
 
+    const finalUrl = response.url || ref.url;
+    if (!isAllowedDownloadUrl(finalUrl)) {
+      await response.body.cancel();
+      throw new Error("Rejected redirect outside the Project Gutenberg allowlist.");
+    }
+
     const contentLength = Number(response.headers.get("content-length"));
     const sizeBytes = Number.isFinite(contentLength) && contentLength > 0 ? contentLength : undefined;
     if (sizeBytes && options?.maxBytes && sizeBytes > options.maxBytes) {
+      await response.body.cancel();
       throw new Error(`Book is ${sizeBytes} bytes, above the cloud limit of ${options.maxBytes}.`);
     }
 
