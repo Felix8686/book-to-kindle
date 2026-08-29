@@ -1,4 +1,4 @@
-import type { BookRequest, Env, TaskQueueMessage } from "./domain";
+import type { BookRequest, BookTaskQueueMessage, Env, TaskQueueMessage } from "./domain";
 import { GmailDelivery, isGmailConfigured } from "./adapters/gmail";
 import { GutendexSource } from "./adapters/gutendex";
 import { TaskRepository } from "./repository";
@@ -137,6 +137,10 @@ function sources() {
   return [new GutendexSource()];
 }
 
+function isBookTaskMessage(message: TaskQueueMessage): message is BookTaskQueueMessage {
+  return message.kind === undefined || message.kind === "book";
+}
+
 export default {
   fetch(request: Request, env: Env): Promise<Response> {
     return handleRequest(request, env);
@@ -155,6 +159,16 @@ export default {
         // Vision jobs are intentionally not auto-retried: repeating AI inference can
         // waste the free quota and create duplicate buttons/tasks. The user can resend.
         message.ack();
+        continue;
+      }
+
+      if (!isBookTaskMessage(message.body)) {
+        console.warn("Unsupported queue message", {
+          chatId: message.body.chatId,
+          userId: message.body.userId,
+          sourceMessageId: message.body.sourceMessageId,
+        });
+        message.retry();
         continue;
       }
 
