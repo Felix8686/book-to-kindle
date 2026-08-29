@@ -186,7 +186,6 @@ async function sendTelegramMessage(
   await telegramApi(env, "sendMessage", {
     chat_id: chatId,
     text: text.slice(0, 4096),
-    disable_web_page_preview: true,
     ...options,
   });
 }
@@ -226,7 +225,13 @@ function cleanTitle(value: string): string {
 
 export function parseTelegramBookRequest(text: string): BookRequest | null {
   const original = text.trim();
-  if (!original || original.startsWith("/")) return null;
+  if (!original) return null;
+  if (
+    original.startsWith("/") &&
+    !/^\/(?:send|book)(?:@\w+)?\s+/i.test(original)
+  ) {
+    return null;
+  }
 
   const authorMatch = original.match(/(?:作者|author)\s*[：:]?\s*([^\n,，;；]+)/i);
   const author = authorMatch?.[1]?.trim().slice(0, 200);
@@ -245,11 +250,12 @@ export function parseTelegramBookRequest(text: string): BookRequest | null {
 
   if (!query) {
     query = original
-      .replace(/^\/(?:send|book)\s+/i, "")
+      .replace(/^\/(?:send|book)(?:@\w+)?\s+/i, "")
       .replace(/^(?:请|麻烦)?(?:帮我)?(?:把)?\s*/u, "")
       .replace(/^我(?:想|要)(?:看|读)\s*/u, "")
       .replace(/^send(?:\s+me)?\s+/i, "")
       .replace(/(?:作者|author)\s*[：:]?\s*[^\n,，;；]+/gi, "")
+      .replace(/(?:中文版|中文|英文|英语|chinese|english)/gi, "")
       .replace(/\b(?:epub|pdf)\b/gi, "")
       .replace(/(?:发|发送|推送|送|放)(?:给|到|至)?\s*(?:我的)?\s*kindle.*$/iu, "")
       .replace(/\s+(?:to|onto)\s+(?:my\s+)?kindle.*$/i, "")
@@ -277,6 +283,7 @@ function helpText(): string {
     "《The Little Prince》 PDF",
     "",
     "命令：",
+    "/send <书名>  创建任务",
     "/status  查看最近任务",
     "/whoami  查看你的 Telegram user ID",
     "/help  查看帮助",
@@ -449,13 +456,13 @@ async function handleCallbackQuery(env: Env, callback: TelegramCallbackQuery): P
   const data = callback.data ?? "";
   const match = data.match(/^sel:([0-9a-f-]+):(\d+)$/i);
   if (!match || !callback.message) {
-    await answerCallbackQuery(env, callback.id, "这个按钮已失效。" );
+    await answerCallbackQuery(env, callback.id, "这个按钮已失效。");
     return;
   }
 
   const userId = String(callback.from.id);
   if (!isAllowedUser(env, userId)) {
-    await answerCallbackQuery(env, callback.id, "无权执行此操作。" );
+    await answerCallbackQuery(env, callback.id, "无权执行此操作。");
     return;
   }
 
@@ -466,19 +473,24 @@ async function handleCallbackQuery(env: Env, callback: TelegramCallbackQuery): P
   const link = await links.get(taskId);
   const task = await repo.get(taskId);
 
-  if (!link || link.userId !== userId || !task) {
-    await answerCallbackQuery(env, callback.id, "任务不存在或不属于你。" );
+  if (
+    !link ||
+    link.userId !== userId ||
+    String(callback.message.chat.id) !== link.chatId ||
+    !task
+  ) {
+    await answerCallbackQuery(env, callback.id, "任务不存在或不属于你。");
     return;
   }
 
   if (task.status !== "needs_selection" || !task.candidates?.length) {
-    await answerCallbackQuery(env, callback.id, "任务已经不需要选择。" );
+    await answerCallbackQuery(env, callback.id, "任务已经不需要选择。");
     return;
   }
 
   const selected = task.candidates[candidateIndex];
   if (!selected) {
-    await answerCallbackQuery(env, callback.id, "这个候选项已失效。" );
+    await answerCallbackQuery(env, callback.id, "这个候选项已失效。");
     return;
   }
 
@@ -490,7 +502,7 @@ async function handleCallbackQuery(env: Env, callback: TelegramCallbackQuery): P
   });
   await env.TASK_QUEUE.send({ taskId });
 
-  await answerCallbackQuery(env, callback.id, "已选择，继续处理。" );
+  await answerCallbackQuery(env, callback.id, "已选择，继续处理。");
   await sendTelegramMessage(
     env,
     String(callback.message.chat.id),
