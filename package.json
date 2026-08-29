@@ -1,0 +1,19 @@
+{
+  "name": "book-to-kindle",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare-first, local-capable workflow for delivering ebooks to Kindle.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "db:migrate:local": "wrangler d1 migrations apply book-to-kindle --local",
+    "db:migrate:remote": "wrangler d1 migrations apply book-to-kindle --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260829.0",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.33.1"
+  }
+}
