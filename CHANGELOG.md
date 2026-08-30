@@ -14,6 +14,15 @@ The project follows Semantic Versioning while it is practical to do so.
 - optional Amazon catalog resolver using supported API credentials
 - additional verified public/open-access source adapters
 
+## [0.6.2] - 2026-08-30
+
+### Fixed
+- Telegram text requests now remove leftover Chinese/English separators after extracting author and format, so `Brian，作者 Jeremy Cooper，epub` searches for `Brian` rather than `Brian，，`
+- ZLibrary search now rejects unrelated popular results returned by the upstream API when a query has no relevant match
+
+### Added
+- regression tests for mixed-punctuation Telegram parsing and ZLibrary title/author relevance filtering
+
 ## [0.6.1] - 2026-08-30
 
 ### Added

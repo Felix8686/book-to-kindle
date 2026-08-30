@@ -387,7 +387,7 @@ function maxTelegramImageBytes(env: Env): number {
 
 function cleanTitle(value: string): string {
   return value
-    .replace(/^\s*[：:,-]+|[：:,-]+\s*$/g, "")
+    .replace(/^[\s：:,，;；-]+|[\s：:,，;；-]+$/g, "")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 300);

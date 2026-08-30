@@ -161,6 +161,34 @@ function identifiersFromBook(book: ZLibraryBook): { isbn10?: string[]; isbn13?: 
   };
 }
 
+function normalizeSearchText(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+export function isRelevantZLibraryResult(
+  book: Pick<ZLibraryBook, "title" | "author">,
+  context: BookSearchContext,
+): boolean {
+  const candidateTitle = normalizeSearchText(book.title);
+  const titleMatches = context.queryVariants.some((variant) => {
+    const expected = normalizeSearchText(variant);
+    return expected.length >= 3 &&
+      (candidateTitle.includes(expected) || expected.includes(candidateTitle));
+  });
+  if (!titleMatches) return false;
+
+  const requestedAuthor = context.request.author?.trim();
+  if (!requestedAuthor) return true;
+  if (!book.author) return false;
+
+  const expectedAuthor = normalizeSearchText(requestedAuthor);
+  const candidateAuthor = normalizeSearchText(book.author);
+  return candidateAuthor.includes(expectedAuthor) || expectedAuthor.includes(candidateAuthor);
+}
+
 function limitedStream(body: ReadableStream<Uint8Array>, maxBytes?: number): ReadableStream<Uint8Array> {
   if (!maxBytes) return body;
   let total = 0;
@@ -319,6 +347,7 @@ export class ZLibrarySource implements SourceAdapter {
         const format = (book.extension ?? "").toLowerCase();
         if (format !== "epub" && format !== "pdf") continue;
         if (!book.id || !book.hash || !book.title) continue;
+        if (!isRelevantZLibraryResult(book, context)) continue;
 
         const id = `zlibrary:${book.id}:${book.hash}:${format}`;
         if (seen.has(id)) continue;
