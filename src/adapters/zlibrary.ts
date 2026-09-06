@@ -56,7 +56,14 @@ interface SourceRef {
   extension: string;
 }
 
-const DEFAULT_DOMAINS = ["https://z-library.biz", "https://1lib.fr", "https://singlelogin.me"];
+const DEFAULT_DOMAINS = [
+  "https://z-lib.gd",
+  "https://z-lib.gl",
+  "https://z-library.ec",
+  "https://zlib.bz",
+  "https://article.sk",
+  "https://articles.sk",
+];
 
 function authCookies(session: Session): string {
   return `remix_userid=${session.userId}; remix_userkey=${session.userKey}`;
@@ -104,6 +111,81 @@ async function tryJsonFetch(
     body = null;
   }
   return { response, body };
+}
+
+function formBody(entries: Array<[string, string | undefined]>): string {
+  const body = new URLSearchParams();
+  for (const [key, value] of entries) {
+    if (value === undefined || value === "") continue;
+    body.append(key, value);
+  }
+  return body.toString();
+}
+
+function zLibraryLanguage(preferredLanguage: string): string | undefined {
+  const normalized = preferredLanguage.trim().toLowerCase();
+  const map: Record<string, string> = {
+    en: "english",
+    es: "spanish",
+    fr: "french",
+    de: "german",
+    pt: "portuguese",
+    it: "italian",
+    ru: "russian",
+    ja: "japanese",
+    ko: "korean",
+    ar: "arabic",
+    hi: "hindi",
+    nl: "dutch",
+    pl: "polish",
+    tr: "turkish",
+    uk: "ukrainian",
+    vi: "vietnamese",
+    id: "indonesian",
+    sv: "swedish",
+    no: "norwegian",
+    da: "danish",
+    fi: "finnish",
+    cs: "czech",
+    ro: "romanian",
+    hu: "hungarian",
+    el: "greek",
+    he: "hebrew",
+    th: "thai",
+    fa: "persian",
+  };
+  return map[normalized];
+}
+
+function searchQueries(context: BookSearchContext): string[] {
+  const titles = [context.request.query, ...context.queryVariants];
+  const seen = new Set<string>();
+  const queries: string[] = [];
+
+  for (const title of titles) {
+    const clean = title.trim();
+    if (!clean) continue;
+    const key = normalizeSearchText(clean);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    queries.push([clean, context.request.author].filter(Boolean).join(" "));
+    if (queries.length >= 3) break;
+  }
+
+  return queries;
+}
+
+function searchRequestBody(query: string, preferredLanguage: string): string {
+  const language = preferredLanguage === "zh" ? undefined : zLibraryLanguage(preferredLanguage);
+  return formBody([
+    ["message", query],
+    ["languages[]", language],
+    ["extensions[]", "EPUB"],
+    ["extensions[]", "PDF"],
+    ["page", "1"],
+    ["limit", "20"],
+    ["order", "bestmatch"],
+  ]);
 }
 
 function isAllowedHost(hostname: string, allowlist: string[]): boolean {
@@ -173,7 +255,7 @@ export function isRelevantZLibraryResult(
   context: BookSearchContext,
 ): boolean {
   const candidateTitle = normalizeSearchText(book.title);
-  const titleMatches = context.queryVariants.some((variant) => {
+  const titleMatches = [context.request.query, ...context.queryVariants].some((variant) => {
     const expected = normalizeSearchText(variant);
     return expected.length >= 3 &&
       (candidateTitle.includes(expected) || expected.includes(candidateTitle));
@@ -221,13 +303,13 @@ export class ZLibrarySource implements SourceAdapter {
       {
         method: "POST",
         headers: {
-          "content-type": "application/json",
+          "content-type": "application/x-www-form-urlencoded",
           "user-agent": userAgent(),
         },
-        body: JSON.stringify({
-          email: this.env.ZLIBRARY_EMAIL,
-          password: this.env.ZLIBRARY_PASSWORD,
-        }),
+        body: formBody([
+          ["email", this.env.ZLIBRARY_EMAIL],
+          ["password", this.env.ZLIBRARY_PASSWORD],
+        ]),
       },
       10000,
     );
@@ -292,14 +374,7 @@ export class ZLibrarySource implements SourceAdapter {
     }
 
     const session = await this.ensureSession();
-    const languages =
-      context.preferredLanguage && context.preferredLanguage !== "zh"
-        ? context.preferredLanguage
-        : "";
-
-    const queries = context.queryVariants.slice(0, 3).map((title) =>
-      [title, context.request.author].filter(Boolean).join(" "),
-    );
+    const queries = searchQueries(context);
     const settled = await Promise.allSettled(
       queries.map(async (query) => {
         const errors: string[] = [];
@@ -310,17 +385,10 @@ export class ZLibrarySource implements SourceAdapter {
               {
                 method: "POST",
                 headers: {
-                  "content-type": "application/json",
+                  "content-type": "application/x-www-form-urlencoded",
                   ...authHeaders(session),
                 },
-                body: JSON.stringify({
-                  message: query,
-                  languages,
-                  extensions: "epub,pdf",
-                  page: 1,
-                  limit: 20,
-                  order: "",
-                }),
+                body: searchRequestBody(query, context.preferredLanguage),
               },
               12000,
             );
@@ -328,8 +396,9 @@ export class ZLibrarySource implements SourceAdapter {
               throw new Error(`ZLibrary search failed with HTTP ${response.status}.`);
             }
             const parsed = body as ZLibrarySearchResponse;
-            if (!parsed.success) throw new Error("ZLibrary search returned success=false.");
-            return parsed.books ?? [];
+            if (parsed.success === false) throw new Error("ZLibrary search returned success=false.");
+            if (!Array.isArray(parsed.books)) throw new Error("ZLibrary search response did not include books.");
+            return parsed.books;
           } catch (error) {
             errors.push(`${domain}: ${error instanceof Error ? error.message : String(error)}`);
           }
@@ -338,11 +407,20 @@ export class ZLibrarySource implements SourceAdapter {
       }),
     );
 
+    const fulfilled = settled.filter(
+      (result): result is PromiseFulfilledResult<ZLibraryBook[]> => result.status === "fulfilled",
+    );
+    if (fulfilled.length === 0 && settled.length > 0) {
+      const reasons = settled
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason));
+      throw new Error(`ZLibrary search failed for every query (${reasons.join("; ")}).`);
+    }
+
     const seen = new Set<string>();
     const candidates: BookCandidate[] = [];
 
-    for (const result of settled) {
-      if (result.status !== "fulfilled") continue;
+    for (const result of fulfilled) {
       for (const book of result.value) {
         const format = (book.extension ?? "").toLowerCase();
         if (format !== "epub" && format !== "pdf") continue;
