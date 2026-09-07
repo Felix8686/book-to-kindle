@@ -1,7 +1,8 @@
 import type { BookRequest, Env } from "./domain";
+import { runWorkersAi } from "./workers-ai";
 
 export const DEFAULT_ASSISTANT_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast" as const;
-const DEFAULT_HISTORY_LIMIT = 8;
+const DEFAULT_HISTORY_LIMIT = 12;
 const MAX_HISTORY_LIMIT = 12;
 const MAX_HISTORY_CONTENT_CHARS = 1600;
 const MAX_REPLY_CHARS = 3500;
@@ -18,6 +19,18 @@ export type AssistantDecision =
       confidence: number;
     }
   | {
+      kind: "author_works";
+      author: string;
+      text: string;
+      confidence: number;
+    }
+  | {
+      kind: "book_info";
+      request: BookRequest;
+      text: string;
+      confidence: number;
+    }
+  | {
       kind: "book";
       request: BookRequest;
       text: string;
@@ -30,23 +43,26 @@ export type AssistantDecision =
     };
 
 const SYSTEM_PROMPT = [
-  "你是 Book to Kindle 的电子书阅读助手，同时负责决定是否调用系统工具。",
-  "用户可以像和正常助手聊天一样输入任意自然语言；绝不能把所有文字默认当作书名。",
-  "你可以讨论作者、作品、系列、阅读顺序、推荐、书籍内容，也可以处理闲聊式或含糊输入。",
+  "你是 Book to Kindle 的自然语言理解层。你的职责是理解用户、上下文和指代，然后选择正确动作；确定性业务和书目事实由代码工具完成。",
+  "绝不能把所有文字默认当作书名，也不要用模型记忆编造作者作品、版本、出版信息或书目事实。",
   "",
-  "你只能选择三种动作：",
-  "1. reply：正常回复用户，不创建任何 Kindle 任务。",
-  "2. book：只有当你确认用户要获取/查找并发送一本明确的书到 Kindle 时使用。",
-  "3. status：用户询问最近一次 Kindle 任务的进度、结果或是否发送成功时使用。",
+  "你只能选择五种动作：",
+  "1. reply：普通聊天、澄清或不需要书目工具的回答；不得在这里凭记忆列作者作品清单。",
+  "2. author_works：用户询问某作者有哪些作品、推荐哪些作品、从哪些作品开始读。只提取 author，具体作品列表由代码查询。",
+  "3. book_info：用户询问某本具体书怎么样、讲什么、出版信息等。必须从当前消息或最近历史可靠解析具体书名，详情由代码查询。",
+  "4. book：只有当用户明确要查找/获取并发送一本具体书到 Kindle 时使用。",
+  "5. status：用户询问最近 Kindle 任务是否发送成功、进度、结果或当前状态时使用。",
   "",
   "关键规则：",
-  "- 人名、作者名、流派名、系列名、主题词、普通问句都不是书名任务。比如用户只发‘倪匡’，必须 reply，不能 book。",
-  "- 不确定用户是在讨论一本书还是要发送它时，必须 reply 并自然追问，不能擅自创建任务。",
-  "- 如果用户只输入一个你高度确定是具体书名的短语，可以结合最近对话判断；仍有歧义就 reply。",
-  "- 用户明确说‘发到 Kindle’、‘帮我找这本书并发送’、‘把第二本发过去’等，且能从当前消息或历史中确定书名时，使用 book。",
-  "- 对‘第二本’、‘刚才那本’、‘作者的第一本’等指代，要利用最近对话解析；无法可靠确定时 reply 追问。",
-  "- book 动作里的 title 必须是你能从用户消息或历史中可靠确定的具体书名，禁止编造。",
-  "- reply 要直接回答用户，不要解释你的内部分类或工具机制。默认使用用户当前消息的语言。",
+  "- 人名、作者名、流派名、系列名、主题词、普通问句本身都不是发送任务。比如用户只发‘倪匡’，通常 reply。",
+  "- ‘倪匡有哪些值得看？’必须 author_works，author=倪匡；不要自己列作品。",
+  "- 如果上一条助手回复是编号书单，用户说‘第二本怎么样？’，必须从最近历史取出第 2 本的准确书名并 book_info。",
+  "- 如果上一条助手回复是编号书单，用户说‘第二本发到 Kindle’，必须从最近历史取出第 2 本的准确书名并 book。",
+  "- 用户说‘刚才那本发成功了吗？’、‘到哪一步了？’、‘发过去没有？’，必须 status，绝不能再次创建 book。",
+  "- 对‘第二本’、‘刚才那本’、‘这本’等指代，优先利用最近对话解析；无法可靠确定时 reply 追问，不得猜。",
+  "- book 和 book_info 的 title 必须来自用户消息或最近历史中已经出现的具体书名，禁止编造。",
+  "- 不确定用户是在讨论一本书还是要发送它时，必须 reply 或 book_info，不能擅自创建发送任务。",
+  "- reply 要直接面向用户，不要解释内部分类、JSON 或工具机制。默认使用用户当前消息的语言。",
   "",
   "输出必须是 JSON，并严格符合给定 schema。",
 ].join("\n");
@@ -69,10 +85,26 @@ function normalizeFormat(value: unknown): "epub" | "pdf" | undefined {
   return undefined;
 }
 
+function normalizeBook(raw: unknown): BookRequest | null {
+  if (!raw || typeof raw !== "object") return null;
+  const book = raw as Record<string, unknown>;
+  const title = cleanString(book.title, 300);
+  if (!title) return null;
+  const author = cleanString(book.author, 200) || undefined;
+  const language = cleanString(book.language, 32) || undefined;
+  const preferredFormat = normalizeFormat(book.format);
+  return {
+    query: title,
+    author,
+    language,
+    preferredFormat,
+  };
+}
+
 export function normalizeAssistantDecision(value: unknown): AssistantDecision {
   const fallback: AssistantDecision = {
     kind: "reply",
-    text: "我不太确定你的意思。你可以直接告诉我想了解哪位作者、哪本书，或者明确说要把哪本书发送到 Kindle。",
+    text: "我不太确定你的意思。你可以继续说明想了解哪位作者、哪本书，或者明确说要把哪本书发送到 Kindle。",
     confidence: 0,
   };
 
@@ -90,10 +122,35 @@ export function normalizeAssistantDecision(value: unknown): AssistantDecision {
     };
   }
 
+  if (action === "author_works") {
+    const author = cleanString(raw.author, 200);
+    if (!author || confidence < 0.55) {
+      return { kind: "reply", text: reply || fallback.text, confidence };
+    }
+    return {
+      kind: "author_works",
+      author,
+      text: reply,
+      confidence,
+    };
+  }
+
+  if (action === "book_info") {
+    const request = normalizeBook(raw.book);
+    if (!request || confidence < 0.55) {
+      return { kind: "reply", text: reply || fallback.text, confidence };
+    }
+    return {
+      kind: "book_info",
+      request,
+      text: reply,
+      confidence,
+    };
+  }
+
   if (action === "book") {
-    const book = raw.book && typeof raw.book === "object" ? (raw.book as Record<string, unknown>) : null;
-    const title = cleanString(book?.title, 300);
-    if (!title || confidence < 0.6) {
+    const request = normalizeBook(raw.book);
+    if (!request || confidence < 0.6) {
       return {
         kind: "reply",
         text: reply || fallback.text,
@@ -101,17 +158,9 @@ export function normalizeAssistantDecision(value: unknown): AssistantDecision {
       };
     }
 
-    const author = cleanString(book?.author, 200) || undefined;
-    const language = cleanString(book?.language, 32) || undefined;
-    const preferredFormat = normalizeFormat(book?.format);
     return {
       kind: "book",
-      request: {
-        query: title,
-        author,
-        language,
-        preferredFormat,
-      },
+      request,
       text: reply,
       confidence,
     };
@@ -159,10 +208,6 @@ export async function decideAssistantAction(
   history: AssistantHistoryMessage[] = [],
 ): Promise<AssistantDecision> {
   const model = env.ASSISTANT_MODEL?.trim() || DEFAULT_ASSISTANT_MODEL;
-  const runText = env.AI.run as unknown as (
-    model: string,
-    inputs: Record<string, unknown>,
-  ) => Promise<unknown>;
 
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
@@ -170,21 +215,22 @@ export async function decideAssistantAction(
     { role: "user", content: text.trim().slice(0, MAX_HISTORY_CONTENT_CHARS) },
   ];
 
-  // Workers AI's run method is receiver-sensitive. Keep env.AI as `this`
-  // even though the cast is needed for response_format fields that may lag
-  // behind the generated Workers TypeScript declarations.
-  const raw = await runText.call(env.AI, model, {
+  const raw = await runWorkersAi(env.AI, model, {
     messages,
     max_tokens: 600,
-    temperature: 0.15,
+    temperature: 0.1,
     response_format: {
       type: "json_schema",
       json_schema: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["reply", "book", "status"] },
+          action: {
+            type: "string",
+            enum: ["reply", "author_works", "book_info", "book", "status"],
+          },
           reply: { type: "string" },
           confidence: { type: "number" },
+          author: { type: "string" },
           book: {
             type: "object",
             properties: {
