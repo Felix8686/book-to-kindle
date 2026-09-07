@@ -42,3 +42,4 @@ When AI fails, arbitrary text must fail safe as conversation/clarification; it m
 - Preserve the Cloudflare-first architecture unless a requirement genuinely needs local resources.
 - A bug fix that reveals a reusable bug class should be fixed at the shared abstraction when practical, not patched independently in every call site.
 - Workers AI methods are receiver-sensitive. Use `runWorkersAi` or `createReceiverSafeAi`; do not invoke an extracted bare `env.AI.run` against the raw binding.
+- Do not merge Assistant architecture changes based on local/CI tests alone; require production Telegram acceptance for context routing, side-effect boundaries and real image inference.
