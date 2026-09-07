@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { normalizeAssistantDecision } from "./assistant";
+import type { Env } from "./domain";
+import { decideAssistantAction, normalizeAssistantDecision } from "./assistant";
 
 describe("assistant decision normalization", () => {
   it("keeps conversational replies as replies", () => {
@@ -64,6 +65,36 @@ describe("assistant decision normalization", () => {
       kind: "status",
       text: "我来查一下。",
       confidence: 0.91,
+    });
+  });
+
+  it("preserves the Workers AI receiver when invoking run", async () => {
+    const ai = {
+      marker: "workers-ai-binding",
+      async run(this: { marker: string }, model: string, inputs: Record<string, unknown>) {
+        expect(this).toBe(ai);
+        expect(this.marker).toBe("workers-ai-binding");
+        expect(model).toBe("@cf/meta/llama-3.1-8b-instruct-fast");
+        expect(inputs).toHaveProperty("messages");
+        return {
+          response: JSON.stringify({
+            action: "reply",
+            reply: "倪匡是香港著名作家。",
+            confidence: 0.99,
+          }),
+        };
+      },
+    };
+
+    const decision = await decideAssistantAction(
+      { AI: ai } as unknown as Env,
+      "倪匡",
+    );
+
+    expect(decision).toEqual({
+      kind: "reply",
+      text: "倪匡是香港著名作家。",
+      confidence: 0.99,
     });
   });
 });
