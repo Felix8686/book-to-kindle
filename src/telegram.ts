@@ -11,6 +11,7 @@ import {
   TelegramConversationRepository,
   type AssistantDecision,
 } from "./assistant";
+import { runWorkersAi } from "./workers-ai";
 
 const VISION_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct" as const;
 const DEFAULT_MAX_TELEGRAM_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -1049,7 +1050,7 @@ function normalizeRecognition(value: unknown): RecognizedBook[] {
   return output.sort((a, b) => b.confidence - a.confidence).slice(0, 5);
 }
 
-async function recognizeBooksFromImage(
+export async function recognizeBooksFromImage(
   env: Env,
   imageBytes: Uint8Array,
   mimeType: string,
@@ -1064,12 +1065,7 @@ async function recognizeBooksFromImage(
     caption ? `The user added this caption: ${caption}` : "The user added no caption.",
   ].join("\n");
 
-  const runVision = env.AI.run as unknown as (
-    model: string,
-    inputs: Record<string, unknown>,
-  ) => Promise<unknown>;
-
-  const raw = await runVision(VISION_MODEL, {
+  const raw = await runWorkersAi(env.AI, VISION_MODEL, {
     messages: [
       {
         role: "system",
