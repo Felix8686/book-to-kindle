@@ -40,6 +40,8 @@ Author work lists and book metadata must be code-backed. The current catalog too
 
 The model must not substitute its memory for these catalog tools. For example, `倪匡有哪些值得看？` is routed to `author_works`; the model is not allowed to invent the list itself.
 
+This requirement was added after production validation showed the model could produce plausible but false author-work associations when allowed to answer from memory.
+
 ## Conversation context
 
 Migration `0009_telegram_conversation.sql` adds bounded recent Telegram conversation history. Only the latest 12 user/assistant messages per private chat/user are retained, and the assistant reads all 12. This allows numbered code-generated lists to become stable context for follow-ups such as `第二本怎么样？` and `第二本发到 Kindle`.
@@ -51,6 +53,8 @@ If the history table is temporarily unavailable, conversation reads/writes degra
 Cloudflare Workers AI binding methods are receiver-sensitive. Extracting `env.AI.run` and invoking it as a bare function can break internal private state.
 
 `src/workers-ai.ts` provides receiver-safe invocation and a compatibility proxy. Text assistant calls use the shared invocation helper. The Queue boundary wraps the legacy image-recognition path with the compatibility proxy so image AI calls retain the original binding receiver as well.
+
+This requirement was added after production logs captured `TypeError: Cannot set properties of undefined (setting '#options')` in both text and image AI paths.
 
 ## Failure behavior
 
