@@ -1,4 +1,10 @@
 import type { BookRequest, Env } from "./domain";
+import {
+  formatAuthorWorksReply,
+  formatBookInfoReply,
+  lookupAuthorWorks,
+  lookupBookInfo,
+} from "./catalog";
 import { runWorkersAi } from "./workers-ai";
 
 export const DEFAULT_ASSISTANT_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast" as const;
@@ -19,6 +25,20 @@ export type AssistantDecision =
       confidence: number;
     }
   | {
+      kind: "book";
+      request: BookRequest;
+      text: string;
+      confidence: number;
+    }
+  | {
+      kind: "status";
+      text: string;
+      confidence: number;
+    };
+
+export type AssistantRoute =
+  | AssistantDecision
+  | {
       kind: "author_works";
       author: string;
       text: string;
@@ -27,17 +47,6 @@ export type AssistantDecision =
   | {
       kind: "book_info";
       request: BookRequest;
-      text: string;
-      confidence: number;
-    }
-  | {
-      kind: "book";
-      request: BookRequest;
-      text: string;
-      confidence: number;
-    }
-  | {
-      kind: "status";
       text: string;
       confidence: number;
     };
@@ -101,7 +110,7 @@ function normalizeBook(raw: unknown): BookRequest | null {
   };
 }
 
-export function normalizeAssistantDecision(value: unknown): AssistantDecision {
+export function normalizeAssistantDecision(value: unknown): AssistantRoute {
   const fallback: AssistantDecision = {
     kind: "reply",
     text: "我不太确定你的意思。你可以继续说明想了解哪位作者、哪本书，或者明确说要把哪本书发送到 Kindle。",
@@ -202,6 +211,28 @@ function sanitizeHistory(history: AssistantHistoryMessage[]): AssistantHistoryMe
     .filter((message) => message.content.length > 0);
 }
 
+async function executeCodeRoute(route: AssistantRoute): Promise<AssistantDecision> {
+  if (route.kind === "author_works") {
+    const works = await lookupAuthorWorks(route.author, 8);
+    return {
+      kind: "reply",
+      text: formatAuthorWorksReply(route.author, works),
+      confidence: route.confidence,
+    };
+  }
+
+  if (route.kind === "book_info") {
+    const info = await lookupBookInfo(route.request.query, route.request.author);
+    return {
+      kind: "reply",
+      text: formatBookInfoReply(info, route.request.query),
+      confidence: route.confidence,
+    };
+  }
+
+  return route;
+}
+
 export async function decideAssistantAction(
   env: Env,
   text: string,
@@ -246,7 +277,8 @@ export async function decideAssistantAction(
     },
   });
 
-  return normalizeAssistantDecision(parseAiResponse(raw));
+  const route = normalizeAssistantDecision(parseAiResponse(raw));
+  return executeCodeRoute(route);
 }
 
 export class TelegramConversationRepository {
