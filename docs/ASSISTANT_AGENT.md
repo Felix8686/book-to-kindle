@@ -83,3 +83,7 @@ Only text with an explicit book-delivery/search action may use the legacy parser
 3. Deploy the feature branch Worker.
 4. Re-run the real Telegram sequence, including contextual second-book resolution, status and a real image.
 5. Do not merge to `main` until production acceptance passes.
+
+## Merge gate
+
+PR #3 must remain unmerged until all production acceptance cases above pass on one deployed feature-branch version. A local/CI PASS is necessary but not sufficient.
