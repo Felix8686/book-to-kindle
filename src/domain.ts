@@ -131,6 +131,7 @@ export interface Env {
   TEMP_OBJECT_TTL_HOURS?: string;
   MAX_CLOUD_FILE_BYTES?: string;
   MAX_TELEGRAM_IMAGE_BYTES?: string;
+  ASSISTANT_MODEL?: string;
   GMAIL_CLIENT_ID?: string;
   GMAIL_CLIENT_SECRET?: string;
   GMAIL_REFRESH_TOKEN?: string;

@@ -14,6 +14,7 @@ import {
   notifyTelegramTaskState,
   processTelegramImageMessage,
 } from "./telegram";
+import { createReceiverSafeAi } from "./workers-ai";
 import { processTask } from "./workflow";
 
 function json(data: unknown, init: ResponseInit = {}): Response {
@@ -224,7 +225,8 @@ export default {
     for (const message of batch.messages) {
       if (message.body.kind === "telegram_image") {
         try {
-          await processTelegramImageMessage(message.body, env);
+          const imageEnv: Env = { ...env, AI: createReceiverSafeAi(env.AI) };
+          await processTelegramImageMessage(message.body, imageEnv);
         } catch (error) {
           console.error("Telegram image queue job failed", message.body.sourceMessageId, error);
         }
