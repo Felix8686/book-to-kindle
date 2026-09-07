@@ -170,7 +170,10 @@ export async function decideAssistantAction(
     { role: "user", content: text.trim().slice(0, MAX_HISTORY_CONTENT_CHARS) },
   ];
 
-  const raw = await runText(model, {
+  // Workers AI's run method is receiver-sensitive. Keep env.AI as `this`
+  // even though the cast is needed for response_format fields that may lag
+  // behind the generated Workers TypeScript declarations.
+  const raw = await runText.call(env.AI, model, {
     messages,
     max_tokens: 600,
     temperature: 0.15,
