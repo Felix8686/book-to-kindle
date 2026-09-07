@@ -41,3 +41,4 @@ When AI fails, arbitrary text must fail safe as conversation/clarification; it m
 - Work on a feature/fix branch and validate before merge.
 - Preserve the Cloudflare-first architecture unless a requirement genuinely needs local resources.
 - A bug fix that reveals a reusable bug class should be fixed at the shared abstraction when practical, not patched independently in every call site.
+- Workers AI methods are receiver-sensitive. Use `runWorkersAi` or `createReceiverSafeAi`; do not invoke an extracted bare `env.AI.run` against the raw binding.
