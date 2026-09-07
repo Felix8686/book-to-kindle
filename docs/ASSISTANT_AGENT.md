@@ -68,7 +68,7 @@ Only text with an explicit book-delivery/search action may use the legacy parser
 2. `倪匡有哪些值得看？` -> `author_works`; returned titles must come from filtered catalog data, not model memory; no task.
 3. Follow the numbered work list with `第二本怎么样？` -> model resolves the exact second title; code executes `book_info`; no task.
 4. Follow the same list with `第二本发到 Kindle` -> model resolves the exact second title and creates exactly one book task.
-5. `刚才那本发成功了吗？` -> `status`; no new task or Queue message.
+5. `刚才那本发成功了吗？` -> `status`; no new task or Queue message. If the latest task is `needs_selection`, the correct answer is that delivery has not completed and user selection is still required.
 6. `把《寻秦记》发到 Kindle` -> one book task with query `寻秦记`.
 7. `/send Pride and Prejudice` -> deterministic existing send path works even if Workers AI is unavailable.
 8. Simulated Workers AI failure + input `倪匡` -> safe reply; no task.
