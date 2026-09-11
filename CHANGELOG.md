@@ -6,6 +6,10 @@ The project follows Semantic Versioning while it is practical to do so.
 
 ## [Unreleased]
 
+### Fixed
+- Resolver no longer adopts an unverified Open Library top search result as the canonical work when no doc strictly matches the request; an unrelated work's ISBNs, authors and edition titles can no longer contaminate the search identity and outrank the user's actual book (regression test added)
+- ZLibrary downloads no longer send session cookies or remix credentials to signed third-party CDN links; credentials are scoped to the account's own session domains (regression tests added)
+
 ### Planned
 - Hermes Skill/MCP bridge
 - browser/share-sheet entry point
