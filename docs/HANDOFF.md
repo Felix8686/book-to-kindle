@@ -88,3 +88,28 @@ Created: D1 `book-to-kindle-staging` (beaac40b-…), Queue `book-to-kindle-tasks
 - An initial "routing bug" (test 4 taking the semantic path) was a test-harness artifact: Git Bash `curl -d` sent the Chinese payload as GBK; real Telegram messages are UTF-8. Use `curl --data-binary @utf8-file.json` for webhook testing.
 - Telegram replies could not be verified end-to-end because the production bot token cannot be exported from Cloudflare secrets; a placeholder token makes sendMessage fail with 401 (expected). To finish that last mile: set the real token on staging (`wrangler secret put TELEGRAM_BOT_TOKEN --config wrangler.staging.toml`) or point Telegram's webhook at staging temporarily.
 - One-off probe worker `ai-probe-once` used for evidence was deleted after the round.
+
+## Round 4 — FINAL: merged to main & deployed to production (2026-09-12)
+
+- MAIN HEAD: `690d553` (merge `00c6ac8` + catalog timeout fix `690d553`), local == origin/main, working tree clean.
+- PRODUCTION DEPLOYMENT: Worker `book-to-kindle`, version `7254227b-13d5-499b-a896-353f4fb770a9`, deployed 2026-09-11T17:51Z (00c6ac8) then 18:12Z (690d553). Production resources untouched otherwise; D1 read-only checks only.
+
+### Production validation (real Telegram, user's own account via Telegram Desktop)
+
+| Scenario | Result |
+|---|---|
+| 金庸有哪些出名的作品 | PASS — semantic ack, AI author_works/金庸, Open Library catalog listed genuine Jin Yong works (書劍恩仇錄 1956, 鹿鼎記, 飛狐外傳 1964, 雪山飛狐 1973…); no title-keyword contamination. First attempt failed safe on a >6s OL timeout; fixed by raising catalog timeout to 10s (`690d553`), retest PASS. |
+| 倪匡有哪些出名的作品 | PARTIAL (safe) — intent=author_works correct; model intermittently mis-extracts 匡→匣 (glyph confusion, model limitation, do NOT patch with keywords/dictionaries); OL data for this author is itself low-quality (pinyin titles). Failure mode is safe ("没能确认" / verified-entity records only). SAFE_FAILURE=YES |
+| 东野圭吾写过哪些小说 | PASS — author_works/东野圭吾, OL catalog returned genuine recent titles (白鸟与蝙蝠 2023 etc.) |
+| 把《天龙八部》发到 Kindle | PASS — deterministic parser, no model call, task created, ZLibrary (real credentials) returned 5 EPUB candidates, paused at needs_selection as designed |
+| 天龙八部 (bare title) | PASS — semantic layer → find_book → title extracted → task created → needs_selection; base experience intact |
+
+- Production logs after deploy: zero `#options` TypeErrors, zero model-not-found, no 5xx storms. `/health` all-green (2 resolvers, 4 sources incl. zlibrary configured, gmail delivery, vision workers_ai, guard enabled).
+- Workers AI: stable with `@cf/meta/llama-3.3-70b-instruct-fp8-fast` (default). Qwen 2.5-7b remains unusable on this account (AiError 5007).
+- LAST_MILE_TELEGRAM: **PASS** — real client → Telegram servers → production webhook → Queue → Workers AI / deterministic parser → production replies observed in the user's Telegram chat.
+- Note: pre-existing production deployment (2026-09-07, uncommitted local experiments by the owner) was replaced by this deploy per task authorization. Rollback available via `wrangler rollback` if ever needed.
+
+### Standing limits (do not "fix" against the architecture)
+
+- 匡→匣 glyph confusion is a model limitation. If a better Chinese model appears on Cloudflare Workers AI, re-evaluate via `SEMANTIC_TEXT_MODEL` env; never add name dictionaries/regexes.
+- Open Library data quality varies by author (pinyin titles, sparse catalogs); catalog responses are structurally verified and safe even when imperfect.
