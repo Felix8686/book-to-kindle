@@ -6,6 +6,14 @@ The project follows Semantic Versioning while it is practical to do so.
 
 ## [Unreleased]
 
+### Added
+- Semantic / Deterministic Responsibility Boundary formalized in `docs/ARCHITECTURE.md` as a standing architectural constraint: semantic understanding -> AI model, deterministic execution -> code
+- Telegram text semantic layer: free-form messages (no explicit structural markers) are enqueued as `telegram_text_semantic` Queue jobs and parsed by Workers AI (`SEMANTIC_TEXT_MODEL` env override, default `@cf/qwen/qwen2.5-7b-instruct`) into structured intent (`find_book | author_works | send_book | unknown`)
+- `author_works` intent: deterministic author-catalog query against Open Library; works are resolved through the author entity and verified by `author_key` membership, so books that merely mention the author in title/description/keywords are never listed
+- Unknown intent now produces a clarification reply instead of creating a bogus book task
+- Explicit structured input (quoted titles, `/send`, labeled author fields, declared format/language) still parses deterministically with no model call; the legacy parser remains the fallback when the AI binding is not configured
+- Regression tests for author-works intent parsing, structural author verification, deterministic entry gating and clarification replies
+
 ### Fixed
 - Resolver no longer adopts an unverified Open Library top search result as the canonical work when no doc strictly matches the request; an unrelated work's ISBNs, authors and edition titles can no longer contaminate the search identity and outrank the user's actual book (regression test added)
 - ZLibrary downloads no longer send session cookies or remix credentials to signed third-party CDN links; credentials are scoped to the account's own session domains (regression tests added)

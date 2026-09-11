@@ -1,5 +1,16 @@
 # Handoff — 2026-09-12 (zcode audit round)
 
+## Round 2 update (same branch, semantic layer)
+
+Commits after `dea20de` implement the Semantic/Deterministic Responsibility Boundary (see `docs/ARCHITECTURE.md` §3, now a standing constraint):
+
+- **Architecture:** `docs/ARCHITECTURE.md` formally defines the boundary — semantic understanding (intent, entities, fuzzy language) belongs to the AI model; deterministic execution (routing, verification, ordering, delivery, state) belongs to code. Regex/keyword intent matching is prohibited as a model-avoidance strategy, and vice versa.
+- **Implementation:** new `src/semantic.ts` (Workers AI text parsing via the existing `AI` binding, JSON Mode, model `@cf/qwen/qwen2.5-7b-instruct` by default, env-overridable via `SEMANTIC_TEXT_MODEL`) and `src/catalog.ts` (deterministic author-works catalog query). Telegram text entry now routes: explicit structured input -> legacy deterministic parser (no model call); free-form text -> `telegram_text_semantic` Queue job -> AI parse -> code routing (`find_book`/`send_book` -> normal `BookRequest` flow; `author_works` -> catalog reply; `unknown` -> clarification). No AI binding -> legacy behavior unchanged.
+- **Author verification guarantee:** catalog works come from the resolved Open Library author entity and are filtered by `author_key` membership; books whose title/description/keywords merely mention the author can never appear (regression-tested with a poisoned fixture).
+- **Tests:** 27/27 passing (16 prior + 11 new); `tsc --noEmit` clean. Existing tests unmodified.
+- **Known trade-offs:** Open Library author search accepts its top entity for cross-script names (东野圭吾 vs Keigo Higashino) when no exact alias matches; works remain structurally verified, but a genuinely wrong top entity would list the wrong author's works — acceptable deterministic risk, revisit if observed. Reply titles are OL primary titles (often English for zh authors); edition-title enrichment is future work. AI parse runs in Queue (not webhook), so free-form requests get one extra async step (~seconds).
+
+
 ## Branch / HEAD
 
 - Base: `main` @ `c88f646dc678a45a032f57e7900ba5f827993f11`
