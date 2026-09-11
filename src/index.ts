@@ -13,6 +13,7 @@ import {
   isTelegramConfigured,
   notifyTelegramTaskState,
   processTelegramImageMessage,
+  processTelegramSemanticText,
 } from "./telegram";
 import { processTask } from "./workflow";
 
@@ -227,6 +228,16 @@ export default {
           await processTelegramImageMessage(message.body, env);
         } catch (error) {
           console.error("Telegram image queue job failed", message.body.sourceMessageId, error);
+        }
+        message.ack();
+        continue;
+      }
+
+      if (message.body.kind === "telegram_text_semantic") {
+        try {
+          await processTelegramSemanticText(message.body, env);
+        } catch (error) {
+          console.error("Telegram semantic text queue job failed", message.body.sourceMessageId, error);
         }
         message.ack();
         continue;

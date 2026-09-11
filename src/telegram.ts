@@ -4,8 +4,11 @@ import type {
   Env,
   TaskRecord,
   TelegramImageQueueMessage,
+  TelegramSemanticTextQueueMessage,
 } from "./domain";
 import { TaskRepository } from "./repository";
+import { isSemanticParsingConfigured, parseTextSemantics } from "./semantic";
+import { queryAuthorWorks, type AuthorWork } from "./catalog";
 
 const VISION_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct" as const;
 const DEFAULT_MAX_TELEGRAM_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -439,6 +442,20 @@ export function parseTelegramBookRequest(text: string): BookRequest | null {
   return { query: cleaned, author, language, preferredFormat };
 }
 
+// Structured request markers are explicit, unambiguous syntax (quoted titles,
+// labeled author fields, declared format/language, the /send command) — they
+// say WHAT the fields are, not WHAT the user wants. Intent for text without
+// such markers is semantic and belongs to the AI layer (ARCHITECTURE.md §3).
+export function hasStructuredRequestMarkers(text: string): boolean {
+  if (/^\/(?:send|book)(?:@\w+)?\s+/i.test(text)) return true;
+  if (/《[^》]{1,300}》/.test(text)) return true;
+  if (/["“”'][^"“”']{1,300}["“”']/.test(text)) return true;
+  if (/(?:作者|author)\s*[：:]/i.test(text)) return true;
+  if (/\b(?:epub|pdf)\b/i.test(text)) return true;
+  if (explicitLanguage(text)) return true;
+  return false;
+}
+
 function helpText(): string {
   return [
     "Book to Kindle 已连接。",
@@ -710,27 +727,50 @@ async function handleMessage(env: Env, message: TelegramMessage): Promise<void> 
   }
 
   const bookRequest = parseTelegramBookRequest(text);
-  if (!bookRequest) {
-    await sendTelegramMessage(env, chatId, helpText(), {
-      reply_to_message_id: message.message_id,
+  // Deterministic first: explicit structured input is parsed by code and never
+  // costs a model call. Free-form text without structural markers is a
+  // semantic question (title request vs question vs catalog query) and is
+  // routed to the AI semantic layer in the Queue when the AI binding exists.
+  if (!isSemanticParsingConfigured(env) || (bookRequest && hasStructuredRequestMarkers(text))) {
+    if (!bookRequest) {
+      await sendTelegramMessage(env, chatId, helpText(), {
+        reply_to_message_id: message.message_id,
+      });
+      return;
+    }
+
+    await createTelegramBookTask({
+      env,
+      chatId,
+      userId,
+      sourceMessageId: message.message_id,
+      request: bookRequest,
     });
+
+    await sendTelegramMessage(
+      env,
+      chatId,
+      `已收到《${bookRequest.query}》，开始查找并发送到 Kindle。`,
+      { reply_to_message_id: message.message_id },
+    );
     return;
   }
 
-  await createTelegramBookTask({
-    env,
-    chatId,
-    userId,
-    sourceMessageId: message.message_id,
-    request: bookRequest,
-  });
+  try {
+    await env.TASK_QUEUE.send({
+      kind: "telegram_text_semantic",
+      chatId,
+      userId,
+      sourceMessageId: message.message_id,
+      text: text.slice(0, 500),
+    });
+  } catch (error) {
+    throw new TelegramQueueEnqueueError("Could not enqueue Telegram semantic text job.", { cause: error });
+  }
 
-  await sendTelegramMessage(
-    env,
-    chatId,
-    `已收到《${bookRequest.query}》，开始查找并发送到 Kindle。`,
-    { reply_to_message_id: message.message_id },
-  );
+  await sendTelegramMessage(env, chatId, "正在理解你的请求……", {
+    reply_to_message_id: message.message_id,
+  });
 }
 
 async function handleSourceCandidateCallback(
@@ -959,7 +999,9 @@ async function recognizeBooksFromImage(
 
   // Cloudflare's runtime supports JSON Mode for this vision model, while the
   // generated Workers TypeScript declaration currently lags that documented field.
-  const runVision = env.AI.run as unknown as (
+  // `run` must keep its `this` binding (see semantic.ts): a detached reference
+  // fails inside the Ai binding with "Cannot set properties of undefined".
+  const runVision = env.AI.run.bind(env.AI) as unknown as (
     model: string,
     inputs: Record<string, unknown>,
   ) => Promise<unknown>;
@@ -1127,6 +1169,95 @@ export async function processTelegramImageMessage(
       { reply_to_message_id: job.sourceMessageId },
     );
   }
+}
+
+export async function processTelegramSemanticText(
+  job: TelegramSemanticTextQueueMessage,
+  env: Env,
+): Promise<void> {
+  if (!env.TELEGRAM_BOT_TOKEN) throw new Error("Telegram bot is not configured.");
+  if (!isAllowedUser(env, job.userId)) return;
+
+  try {
+    const parsed = await parseTextSemantics(env, job.text);
+
+    if (parsed.intent === "author_works" && parsed.author) {
+      await sendAuthorWorksReply(env, job.chatId, job.sourceMessageId, parsed.author);
+      return;
+    }
+
+    if ((parsed.intent === "find_book" || parsed.intent === "send_book") && parsed.title) {
+      const request: BookRequest = {
+        query: parsed.title,
+        ...(parsed.author ? { author: parsed.author } : {}),
+        ...(parsed.language ? { language: parsed.language } : {}),
+        preferredFormat: parsed.preferredFormat ?? explicitFormat(job.text),
+      };
+      await createTelegramBookTask({
+        env,
+        chatId: job.chatId,
+        userId: job.userId,
+        sourceMessageId: job.sourceMessageId,
+        request,
+      });
+      await sendTelegramMessage(
+        env,
+        job.chatId,
+        `已理解你要找《${request.query}》，开始查找并发送到 Kindle。`,
+        { reply_to_message_id: job.sourceMessageId },
+      );
+      return;
+    }
+
+    await sendTelegramMessage(
+      env,
+      job.chatId,
+      "我没太理解你的意思。可以发送书名（如《西游记》），或询问某位作者写过哪些作品，也可以直接发送书籍封面图片。",
+      { reply_to_message_id: job.sourceMessageId },
+    );
+  } catch (error) {
+    console.error("Telegram semantic text job failed", job.sourceMessageId, error);
+    await sendTelegramMessage(
+      env,
+      job.chatId,
+      "语义理解暂时失败。请稍后重发消息，或直接发送书名。",
+      { reply_to_message_id: job.sourceMessageId },
+    );
+  }
+}
+
+async function sendAuthorWorksReply(
+  env: Env,
+  chatId: string,
+  sourceMessageId: number,
+  author: string,
+): Promise<void> {
+  let works: AuthorWork[] = [];
+  try {
+    works = await queryAuthorWorks(author);
+  } catch (error) {
+    console.warn("Author works query failed", author, error);
+  }
+
+  if (works.length === 0) {
+    await sendTelegramMessage(
+      env,
+      chatId,
+      `暂时没能确认「${author}」的作品记录。可以直接发送具体书名来创建发送任务。`,
+      { reply_to_message_id: sourceMessageId },
+    );
+    return;
+  }
+
+  const lines = works.map(
+    (work, index) => `${index + 1}. 《${work.title}》${work.firstPublishYear ? `（${work.firstPublishYear}）` : ""}`,
+  );
+  await sendTelegramMessage(
+    env,
+    chatId,
+    [`Open Library 收录的「${author}」作品（按版本数量排序）：`, ...lines].join("\n"),
+    { reply_to_message_id: sourceMessageId },
+  );
 }
 
 export function isTelegramConfigured(env: Env): boolean {

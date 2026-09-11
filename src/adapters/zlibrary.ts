@@ -493,8 +493,12 @@ export class ZLibrarySource implements SourceAdapter {
       throw new Error(`ZLibrary download lookup failed on all domains (${errors.join("; ")}).`);
     }
 
+    // Direct signed CDN links are pre-authorized by their token; session
+    // credentials must never leak to those third-party hosts. Only requests
+    // to the account's own session domains carry the remix auth headers.
+    const sendAuthHeaders = isAllowedHost(new URL(downloadUrl).hostname, session.domains);
     const response = await fetch(downloadUrl, {
-      headers: authHeaders(session),
+      headers: sendAuthHeaders ? authHeaders(session) : { "user-agent": userAgent() },
       redirect: "follow",
     });
 

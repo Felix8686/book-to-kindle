@@ -96,7 +96,15 @@ export interface TelegramImageQueueMessage {
   mimeType?: string;
 }
 
-export type TaskQueueMessage = BookTaskQueueMessage | TelegramImageQueueMessage;
+export interface TelegramSemanticTextQueueMessage {
+  kind: "telegram_text_semantic";
+  chatId: string;
+  userId: string;
+  sourceMessageId: number;
+  text: string;
+}
+
+export type TaskQueueMessage = BookTaskQueueMessage | TelegramImageQueueMessage | TelegramSemanticTextQueueMessage;
 
 export interface SourceAdapter {
   name: string;
@@ -131,6 +139,7 @@ export interface Env {
   TEMP_OBJECT_TTL_HOURS?: string;
   MAX_CLOUD_FILE_BYTES?: string;
   MAX_TELEGRAM_IMAGE_BYTES?: string;
+  SEMANTIC_TEXT_MODEL?: string;
   GMAIL_CLIENT_ID?: string;
   GMAIL_CLIENT_SECRET?: string;
   GMAIL_REFRESH_TOKEN?: string;
