@@ -93,6 +93,67 @@ describe("Resolver canonical work & metadata isolation", () => {
     }
   });
 
+  it("does not adopt an unrelated top Open Library result when no doc strictly matches", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {
+      const urlStr = url.toString();
+      if (urlStr.includes("openlibrary.org/search.json")) {
+        return new Response(
+          JSON.stringify({
+            docs: [
+              {
+                key: "/works/OL999W",
+                title: "An Unrelated Novel",
+                author_name: ["Someone Else"],
+                isbn: ["4444444444", "9784444444444"],
+              },
+              {
+                key: "/works/OL998W",
+                title: "Another Unrelated Story",
+                author_name: ["Third Party"],
+                isbn: ["5555555555", "9785555555555"],
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (urlStr.includes("/works/OL999W/editions.json")) {
+        return new Response(
+          JSON.stringify({
+            entries: [
+              {
+                title: "无关作品的中文版",
+                languages: [{ key: "/languages/chi" }],
+                isbn_13: ["9787777777777"],
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ items: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      const request: BookRequest = { query: "某本冷门中文书" };
+      const context = await resolveBookSearchContext(request, "zh");
+
+      // A top result that matches neither the title nor a supplied author must
+      // not inject its ISBNs, authors or edition titles into the canonical
+      // identity; otherwise an unrelated candidate can outrank the real book.
+      expect(context.identity.identifiers.isbn13 ?? []).not.toContain("9784444444444");
+      expect(context.identity.identifiers.isbn13 ?? []).not.toContain("9787777777777");
+      expect(context.identity.authors).not.toContain("Someone Else");
+      expect(context.queryVariants).not.toContain("无关作品的中文版");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("handles cross-language edition discovery for English original into Chinese", async () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {

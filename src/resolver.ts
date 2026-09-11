@@ -152,20 +152,16 @@ async function resolveOpenLibrary(
   const docs = data.docs ?? [];
   const reqAuthors = request.author ? [request.author] : [];
 
-  // Canonical Work selection: choose the single most trustworthy match
-  let canonicalDoc: OpenLibrarySearchDoc | undefined;
-  for (const doc of docs) {
-    if (!doc.title) continue;
-    if (isTitleCompatible(doc.title, request.query) && isSameOrCompatibleAuthor(doc.author_name, reqAuthors)) {
-      canonicalDoc = doc;
-      break;
-    }
-  }
-
-  // Fallback to first doc if none strictly matched
-  if (!canonicalDoc && docs.length > 0) {
-    canonicalDoc = docs[0];
-  }
+  // Canonical Work selection: choose the single most trustworthy match.
+  // Only a strictly verified doc may contribute identity evidence; adopting
+  // an unverified top result would let an unrelated work's ISBNs, authors and
+  // edition titles outrank the user's actual request (metadata contamination).
+  const canonicalDoc = docs.find(
+    (doc) =>
+      Boolean(doc.title) &&
+      isTitleCompatible(doc.title, request.query) &&
+      isSameOrCompatibleAuthor(doc.author_name, reqAuthors),
+  );
 
   const titles: BookTitleVariant[] = [];
   const seen = new Set<string>();
