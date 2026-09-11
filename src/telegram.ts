@@ -999,7 +999,9 @@ async function recognizeBooksFromImage(
 
   // Cloudflare's runtime supports JSON Mode for this vision model, while the
   // generated Workers TypeScript declaration currently lags that documented field.
-  const runVision = env.AI.run as unknown as (
+  // `run` must keep its `this` binding (see semantic.ts): a detached reference
+  // fails inside the Ai binding with "Cannot set properties of undefined".
+  const runVision = env.AI.run.bind(env.AI) as unknown as (
     model: string,
     inputs: Record<string, unknown>,
   ) => Promise<unknown>;

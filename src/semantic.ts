@@ -7,7 +7,7 @@ import { normalizeBookLanguage } from "./settings";
 // creation, catalog queries, verification, ordering) stays deterministic code.
 // Never grow this file into keyword/regex intent matching.
 
-export const DEFAULT_SEMANTIC_TEXT_MODEL = "@cf/qwen/qwen2.5-7b-instruct" as const;
+export const DEFAULT_SEMANTIC_TEXT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast" as const;
 
 export type TextIntent = "find_book" | "author_works" | "send_book" | "unknown";
 
@@ -77,7 +77,10 @@ const PARSE_PROMPT = [
 export async function parseTextSemantics(env: Env, text: string): Promise<SemanticParseResult> {
   // Cloudflare supports JSON Mode for this model; the generated Workers
   // TypeScript declarations lag that documented field (same bridge as vision).
-  const runModel = env.AI.run as unknown as (
+  // The method must keep its `this` binding: workerd's Ai class reads call
+  // configuration from private fields, and a detached `env.AI.run` reference
+  // fails with "Cannot set properties of undefined (setting '#options')".
+  const runModel = env.AI.run.bind(env.AI) as unknown as (
     model: string,
     inputs: Record<string, unknown>,
   ) => Promise<unknown>;

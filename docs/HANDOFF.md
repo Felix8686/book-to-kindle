@@ -63,3 +63,28 @@ Commits after `dea20de` implement the Semantic/Deterministic Responsibility Boun
 npm run typecheck
 npm test
 ```
+
+## Round 3 update — real-environment acceptance (2026-09-12)
+
+### Staging environment (fully isolated from production)
+
+Created: D1 `book-to-kindle-staging` (beaac40b-…), Queue `book-to-kindle-tasks-staging` + DLQ, R2 `book-to-kindle-files-staging`, Worker `book-to-kindle-staging` (https://book-to-kindle-staging.mzer8-substracker.workers.dev), configured via `wrangler.staging.toml` (committed). Secrets set: placeholder bot token, random webhook secret, API token, allowlist 1118263109 (read from production D1, read-only). Production was never touched.
+
+### Fails found in real environment, root-caused and fixed
+
+1. **All AI calls failed with `TypeError: Cannot set properties of undefined (setting '#options')`.** Root cause: `env.AI.run` was captured as a detached function reference; workerd's `Ai` class reads call config from private fields, so the lost `this` broke every call. This also meant the pre-existing vision path (`recognizeBooksFromImage`) had never been able to work in production. Fix: `env.AI.run.bind(env.AI)` in `semantic.ts` and `telegram.ts`. Proven by controlled probe: bound call → request reached Workers AI; unbound → TypeError.
+2. **`@cf/qwen/qwen2.5-7b-instruct` unusable on this account** (`AiError 5007: No such model`, 5/5 probes; one earlier success suggests flaky rollout). Default semantic model switched to `@cf/meta/llama-3.3-70b-instruct-fp8-fast` (stable, correct Chinese intent/entity extraction for 金庸/东野圭吾; overridable via `SEMANTIC_TEXT_MODEL`).
+
+### Acceptance results (staging, synthetic UTF-8 Telegram updates)
+
+1. 金庸有哪些出名的作品 — semantic branch taken (no task created), AI returned `intent=author_works, author=金庸`, catalog works from author_key verification were all genuine Jin Yong titles (書劍恩仇錄/鹿鼎記/神鵰俠侶…), zero title-keyword contamination. PASS (reply delivery itself unverifiable without real bot token — see below).
+2. 倪匡有哪些出名的作品 — intent correct (`author_works`), but the model mis-extracts the character 匡 as 匣 (glyph confusion, reproduced in JSON mode and raw mode, also with 70b). Catalog then safely returns nothing ("没能确认" reply). FAIL — model capability limit, fail-safe behavior; not fixable with keyword patches per the architecture boundary. Revisit when a Chinese-strong model (e.g. Qwen) is stably available on the account.
+3. 东野圭吾写过哪些小说 — AI returned `intent=author_works, author=东野圭吾`. PASS.
+4. 把《天龙八部》发到 Kindle — `markers=true` → deterministic parser → task `{"query":"天龙八部","preferredFormat":"epub"}` created, no AI call, workflow ran real source searches and correctly ended `needs_source` (no ZLibrary credentials on staging). PASS.
+5. 天龙八部 (bare title) — semantic branch → AI `find_book`, `title=天龙八部` → task created → `needs_source`. Base experience intact. PASS.
+
+### Notes
+
+- An initial "routing bug" (test 4 taking the semantic path) was a test-harness artifact: Git Bash `curl -d` sent the Chinese payload as GBK; real Telegram messages are UTF-8. Use `curl --data-binary @utf8-file.json` for webhook testing.
+- Telegram replies could not be verified end-to-end because the production bot token cannot be exported from Cloudflare secrets; a placeholder token makes sendMessage fail with 401 (expected). To finish that last mile: set the real token on staging (`wrangler secret put TELEGRAM_BOT_TOKEN --config wrangler.staging.toml`) or point Telegram's webhook at staging temporarily.
+- One-off probe worker `ai-probe-once` used for evidence was deleted after the round.
