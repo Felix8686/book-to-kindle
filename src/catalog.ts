@@ -46,7 +46,9 @@ async function fetchJson<T>(url: string, fetchImpl: typeof fetch): Promise<T> {
       accept: "application/json",
       "user-agent": "book-to-kindle/0.7 (+https://github.com/Felix8686/book-to-kindle)",
     },
-    signal: AbortSignal.timeout(6000),
+    // Production runs showed occasional >6s Open Library latencies that
+    // aborted otherwise-successful author catalog lookups.
+    signal: AbortSignal.timeout(10000),
   });
   if (!response.ok) throw new Error(`Author catalog request failed with HTTP ${response.status}.`);
   return (await response.json()) as T;
