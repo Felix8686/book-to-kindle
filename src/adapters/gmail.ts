@@ -1,4 +1,4 @@
-import type { DeliveryAdapter, DeliveryReceipt, Env } from "../domain";
+import type { DeliveryAdapter, DeliveryReceipt, Env, TaskRecord } from "../domain";
 
 interface TokenResponse {
   access_token?: string;
@@ -23,6 +23,26 @@ export class DeliveryFenceBlockedError extends Error {
     super(`Delivery fence for task ${taskId} is already ${state}; automatic resend is blocked.`);
     this.name = "DeliveryFenceBlockedError";
   }
+}
+
+function receiptFromFence(row: DeliveryFenceRow): DeliveryReceipt | null {
+  if (row.state !== "accepted") return null;
+  return {
+    provider: "gmail",
+    acceptedAt: row.updated_at,
+    messageId: row.provider_message_id || undefined,
+    threadId: row.provider_thread_id || undefined,
+  };
+}
+
+async function readDeliveryFence(env: Env, taskId: string): Promise<DeliveryFenceRow | null> {
+  return env.DB
+    .prepare(
+      `SELECT state, updated_at, provider_message_id, provider_thread_id
+       FROM delivery_fences WHERE task_id = ?1`,
+    )
+    .bind(taskId)
+    .first<DeliveryFenceRow>();
 }
 
 function encodeHeader(value: string): string {
@@ -144,23 +164,9 @@ async function claimDeliveryFence(
 
   if (Number(inserted.meta.changes ?? 0) > 0) return null;
 
-  const existing = await env.DB
-    .prepare(
-      `SELECT state, updated_at, provider_message_id, provider_thread_id
-       FROM delivery_fences WHERE task_id = ?1`,
-    )
-    .bind(taskId)
-    .first<DeliveryFenceRow>();
-
-  if (existing?.state === "accepted") {
-    return {
-      provider: "gmail",
-      acceptedAt: existing.updated_at,
-      messageId: existing.provider_message_id || undefined,
-      threadId: existing.provider_thread_id || undefined,
-    };
-  }
-
+  const existing = await readDeliveryFence(env, taskId);
+  const receipt = existing ? receiptFromFence(existing) : null;
+  if (receipt) return receipt;
   throw new DeliveryFenceBlockedError(taskId, existing?.state ?? "unknown");
 }
 
@@ -205,6 +211,11 @@ export class GmailDelivery implements DeliveryAdapter {
 
   constructor(private readonly env: Env) {}
 
+  async recover(task: TaskRecord): Promise<DeliveryReceipt | null> {
+    const existing = await readDeliveryFence(this.env, task.id);
+    return existing ? receiptFromFence(existing) : null;
+  }
+
   async deliver(input: {
     task: Parameters<DeliveryAdapter["deliver"]>[0]["task"];
     object: R2ObjectBody;
@@ -214,9 +225,26 @@ export class GmailDelivery implements DeliveryAdapter {
     const selected = input.task.selectedCandidate;
     if (!selected) throw new Error("Task has no selected candidate to deliver.");
 
-    // Refresh OAuth and prepare the MIME stream before claiming the permanent
-    // side-effect fence. Failures here are known to happen before Gmail send.
+    // Always inspect an existing permanent fence before touching OAuth or R2.
+    // A replay after a successful Gmail send must be recoverable even if OAuth
+    // is temporarily unavailable during the replay.
+    const existing = await readDeliveryFence(this.env, input.task.id);
+    if (existing) {
+      const recovered = receiptFromFence(existing);
+      if (recovered) return recovered;
+      throw new DeliveryFenceBlockedError(input.task.id, existing.state);
+    }
+
+    // OAuth failure happens before the irreversible Gmail side effect, so the
+    // permanent delivery fence is deliberately not claimed yet.
     const token = await getAccessToken(this.env);
+
+    const attemptId = crypto.randomUUID();
+    const previousReceipt = await claimDeliveryFence(this.env, input.task.id, attemptId);
+    if (previousReceipt) return previousReceipt;
+
+    // Construct the MIME stream only after this attempt owns the fence. The
+    // stream starts consuming the R2 object as soon as it is constructed.
     const contentType = input.object.httpMetadata?.contentType || "application/octet-stream";
     const message = mimeStream({
       object: input.object,
@@ -226,10 +254,6 @@ export class GmailDelivery implements DeliveryAdapter {
       extension: selected.format,
       contentType,
     });
-
-    const attemptId = crypto.randomUUID();
-    const previousReceipt = await claimDeliveryFence(this.env, input.task.id, attemptId);
-    if (previousReceipt) return previousReceipt;
 
     try {
       const response = await fetch(
