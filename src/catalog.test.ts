@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   formatAuthorWorksReply,
+  formatBookInfoReply,
   lookupAuthorWorks,
   lookupBookInfo,
 } from "./catalog";
@@ -108,5 +109,25 @@ describe("catalog tools", () => {
     expect(info?.authors).toContain("倪匡");
     expect(info?.description).toBe("卫斯理系列作品。");
     expect(info?.sources).toEqual(expect.arrayContaining(["google-books", "openlibrary"]));
+  });
+
+  it("does not silently narrow a broad requested title to a catalog edition", () => {
+    const reply = formatBookInfoReply(
+      {
+        title: "纳尼亚传奇(狮子女巫和魔衣柜)(精)",
+        authors: ["C. S. Lewis"],
+        publishedDate: "2005",
+        publisher: "Test Publisher",
+        categories: ["Fiction"],
+        sources: ["google-books"],
+      },
+      "纳尼亚传奇",
+    );
+
+    expect(reply).toContain("你问的是《纳尼亚传奇》");
+    expect(reply).toContain("一个可能的具体条目");
+    expect(reply).toContain("在你明确确认前，我不会把原始书名替换成这个条目");
+    expect(reply).toContain("请明确说");
+    expect(reply).not.toContain("要发送到 Kindle，可以直接说“这本发到 Kindle”");
   });
 });
