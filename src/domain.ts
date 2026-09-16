@@ -113,6 +113,12 @@ export interface SourceAdapter {
 
 export interface DeliveryAdapter {
   name: string;
+  /**
+   * Recover a receipt that was durably accepted by the provider but not yet
+   * persisted on the task because the worker crashed between side effect and
+   * task-state update. A null result means the outcome is not known accepted.
+   */
+  recover?(task: TaskRecord): Promise<DeliveryReceipt | null>;
   deliver(input: {
     task: TaskRecord;
     object: R2ObjectBody;
