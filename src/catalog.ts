@@ -283,7 +283,16 @@ export function formatBookInfoReply(info: CatalogBookInfo | null, requestedTitle
     return `我能确定你指的是《${requestedTitle}》，但当前书目来源没有返回足够可靠的详情。要发送的话可以直接说“把《${requestedTitle}》发到 Kindle”。`;
   }
 
-  const lines = [`《${info.title}》`];
+  const requested = requestedTitle.trim();
+  const exactTitle = normalizeText(info.title) === normalizeText(requested);
+  const lines = exactTitle
+    ? [`《${requested}》`]
+    : [
+        `你问的是《${requested}》。`,
+        `当前书目来源返回了一个可能的具体条目：《${info.title}》。`,
+        "它可能只是该系列、某一卷或某个版本；在你明确确认前，我不会把原始书名替换成这个条目。",
+      ];
+
   if (info.authors.length) lines.push(`作者：${info.authors.join("、")}`);
   if (info.publishedDate) lines.push(`出版时间：${info.publishedDate}`);
   if (info.publisher) lines.push(`出版社：${info.publisher}`);
@@ -292,6 +301,12 @@ export function formatBookInfoReply(info: CatalogBookInfo | null, requestedTitle
     const description = info.description.length > 700 ? `${info.description.slice(0, 697)}...` : info.description;
     lines.push(`简介：${description}`);
   }
-  lines.push("要发送到 Kindle，可以直接说“这本发到 Kindle”。");
+
+  if (exactTitle) {
+    lines.push(`要发送到 Kindle，可以直接说“把《${requested}》发到 Kindle”。`);
+  } else {
+    lines.push(`如果你就是指这个具体条目，请明确说“把《${info.title}》发到 Kindle”；否则请补充具体卷名或版本。`);
+  }
+
   return lines.join("\n");
 }
