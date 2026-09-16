@@ -1,89 +1,166 @@
 # Telegram Assistant Architecture
 
-## Non-negotiable principle
+## Core rule
 
-Book to Kindle uses this split at the architecture boundary:
+```text
+user natural language
+-> Queue
+-> model understands intent/context
+-> code validates/grounds entities
+-> deterministic code tool executes
+-> retry-safe user reply
+```
 
-`user natural language -> model understands intent/context -> code tool executes -> user-facing result`
+The model owns natural-language understanding. Code owns facts, validation and side effects.
 
-The model owns natural-language understanding: intent, context and references such as `第二本`, `刚才那本`, and `这本`.
+Do not fix language-understanding bugs by accumulating per-title/per-author regex patches. Do not let the model invent bibliographic facts or task state.
 
-Deterministic code owns bibliographic facts, source search, downloads, D1/Queue/R2 state, Gmail/Kindle delivery, status and all other side effects.
+## Why the assistant is queued
 
-Do not fix natural-language bugs by accumulating regexes or one-off author/title branches. Do not let the model invent book lists or task state when code can retrieve them.
+Free-form Telegram text is not processed by Workers AI inside the webhook.
 
-The same rules are mirrored in the repository-root `AGENTS.md` so future coding agents see them before modifying the project.
+The webhook validates the request, persists `telegram_assistant_jobs`, enqueues `telegram_assistant_text`, and returns quickly.
 
-## Why this exists
+This gives three reliability properties:
 
-The Telegram entry point used to treat almost every non-command text message as a book title. That made inputs such as an author name (`倪匡`) enter the download workflow and forced the product into an endless cycle of adding special-case parsers.
+1. AI/catalog latency does not hold the Telegram webhook open.
+2. Telegram final-reply failures can be retried.
+3. A retry cannot silently create a second logical book task because the assistant job persists its reserved `task_id` and Queue state.
 
-The text entry point is assistant-first rather than title-first.
+## Model routes
 
-## Model routes and code actions
+The model may choose:
 
-The model may classify an utterance into five semantic routes:
+- `reply`
+- `author_works`
+- `book_info`
+- `book`
+- `status`
 
-- `reply`: normal conversation or clarification; no side effect.
-- `author_works`: model extracts the author; code queries Open Library / Google Books and builds the work list.
-- `book_info`: model resolves a concrete title, including contextual references; code queries bibliographic metadata.
-- `book`: model resolves a concrete title for Kindle delivery; code creates the existing `BookRequest` and runs the existing workflow.
-- `status`: model recognizes a task-status question; code queries the user's latest real task.
+`author_works` and `book_info` use code-backed Open Library / Google Books queries. The model must not answer those facts from memory when a deterministic tool exists.
 
-`author_works` and `book_info` are executed inside the assistant layer and converted into a normal reply before Telegram receives the decision. Telegram still sees only conversational reply, book task, or status behavior.
+`status` reads actual D1 task state.
 
-Explicit `/send <book>` remains deterministic and bypasses the LLM.
+`book` may create a Kindle task only after entity grounding succeeds.
 
-## Bibliographic reliability
+Explicit `/send <book>` remains deterministic and bypasses this free-form assistant Queue.
 
-Author work lists and book metadata must be code-backed. The current catalog tool queries Open Library and Google Books, filters results by normalized author/title compatibility, deduplicates titles and prefers entries corroborated by multiple sources or stronger catalog coverage.
+## Entity grounding
 
-The model must not substitute its memory for these catalog tools. For example, `倪匡有哪些值得看？` is routed to `author_works`; the model is not allowed to invent the list itself.
+Model output is a proposal, not authorization.
 
-This requirement was added after production validation showed the model could produce plausible but false author-work associations when allowed to answer from memory.
+Any model-returned title/author used by code must be present in:
+
+- the current user message; or
+- recent bounded conversation history.
+
+The model may not silently:
+
+- correct spelling;
+- replace similar glyphs;
+- translate a title;
+- expand an abbreviation into a different title;
+- invent an author from memory.
+
+Example failure class:
+
+```text
+input: 纳尼亚传奇
+model output: 纽里亚主事书
+```
+
+This must produce clarification/no task. The mutated title must never reach resolver/source search.
+
+For contextual references such as `第二本`, the resolved concrete title must already appear in recent history.
+
+If title is grounded but an optional model-supplied author is not, the author is removed rather than allowed to contaminate search.
 
 ## Conversation context
 
-Migration `0009_telegram_conversation.sql` adds bounded recent Telegram conversation history. Only the latest 12 user/assistant messages per private chat/user are retained, and the assistant reads all 12. This allows numbered code-generated lists to become stable context for follow-ups such as `第二本怎么样？` and `第二本发到 Kindle`.
+Migration `0009_telegram_conversation.sql` stores only the latest 12 user/assistant messages per private chat/user.
 
-If the history table is temporarily unavailable, conversation reads/writes degrade safely and do not block the Telegram interaction.
+Purpose:
 
-## Workers AI receiver safety
+```text
+第二本怎么样？
+第二本发到 Kindle
+这本要中文版
+刚才那本发成功了吗？
+```
 
-Cloudflare Workers AI binding methods are receiver-sensitive. Extracting `env.AI.run` and invoking it as a bare function can break internal private state.
+History is bounded context, not long-term memory.
 
-`src/workers-ai.ts` provides receiver-safe invocation and a compatibility proxy. Text assistant calls use the shared invocation helper. The Queue boundary wraps the legacy image-recognition path with the compatibility proxy so image AI calls retain the original binding receiver as well.
+## Durable assistant job state
 
-This requirement was added after production logs captured `TypeError: Cannot set properties of undefined (setting '#options')` in both text and image AI paths.
+Migration `0013_telegram_assistant_jobs.sql` stores:
 
-## Failure behavior
+```text
+update_id
+chat_id
+user_id
+source_message_id
+input_text
+state
+lease_token / lease_until
+task_id
+book_enqueued
+response_text
+```
 
-An AI routing failure must never fall back to treating arbitrary text as a book title.
+### Retry rules
 
-Only text with an explicit book-delivery/search action may use the legacy parser as a fallback. Otherwise the bot replies that it could not reliably understand the message and creates no Kindle task.
+- Duplicate assistant Queue messages may not create a second logical task.
+- Once `task_id` is reserved, retries reuse it.
+- If task exists but book Queue send was not confirmed, retry may enqueue the same task again; book execution lease + delivery fence make that safe.
+- Once `response_text` is persisted, reply retry does not need to rerun the model.
+- A failed AI call returns a safe no-task reply; arbitrary text never degrades into “send the whole string as a book”.
 
-## Regression acceptance cases
+## Workers AI safety
 
-1. `倪匡` -> conversational reply; no task row and no Queue book message.
-2. `倪匡有哪些值得看？` -> `author_works`; returned titles must come from filtered catalog data, not model memory; no task.
-3. Follow the numbered work list with `第二本怎么样？` -> model resolves the exact second title; code executes `book_info`; no task.
-4. Follow the same list with `第二本发到 Kindle` -> model resolves the exact second title and creates exactly one book task.
-5. `刚才那本发成功了吗？` -> `status`; no new task or Queue message. If the latest task is `needs_selection`, the correct answer is that delivery has not completed and user selection is still required.
-6. `把《寻秦记》发到 Kindle` -> one book task with query `寻秦记`.
-7. `/send Pride and Prejudice` -> deterministic existing send path works even if Workers AI is unavailable.
-8. Simulated Workers AI failure + input `倪匡` -> safe reply; no task.
-9. Simulated Workers AI failure + explicit `把《寻秦记》发到 Kindle` -> deterministic fallback may create the task.
-10. Real image recognition must not reproduce the Workers AI receiver/private-field error.
-11. Existing candidate selection, Queue processing, R2 cleanup, Gmail delivery and task-state notifications remain unchanged.
+`src/workers-ai.ts` is the shared invocation boundary.
 
-## Deployment order
+Cloudflare's AI binding is receiver-sensitive. Never invoke a detached raw `env.AI.run` function.
 
-1. Run typecheck and unit tests.
-2. Run isolated Telegram / catalog / Workers AI receiver regression tests.
-3. Deploy the feature branch Worker.
-4. Re-run the real Telegram sequence, including contextual second-book resolution, status and a real image.
-5. Do not merge to `main` until production acceptance passes.
+Text assistant default:
 
-## Merge gate
+```text
+@cf/meta/llama-3.3-70b-instruct-fp8-fast
+```
 
-PR #3 must remain unmerged until all production acceptance cases above pass on one deployed feature-branch version. A local/CI PASS is necessary but not sufficient.
+Vision path:
+
+```text
+@cf/qwen/qwen3.8-27b
+```
+
+## Code-backed catalog reliability
+
+Author lists and book details come from `src/catalog.ts`.
+
+Download-source results subsequently pass through the shared relevance gate before ranking.
+
+Do not let an LLM-provided title/author or a provider's loose search result bypass these deterministic checks.
+
+## Required regression cases
+
+At minimum, staging must test:
+
+1. `纳尼亚传奇` — exact entity preserved or safe clarification; mutated title is FAIL.
+2. `哈利波特` — same entity-fidelity rule.
+3. `倪匡` — no blind book task.
+4. `倪匡有哪些值得看？` — code-backed works; no book task.
+5. `第二本怎么样？` — exact historical item -> `book_info`; no task.
+6. `第二本发到 Kindle` — exactly one logical book task.
+7. `刚才那本发成功了吗？` — real status; no new task.
+8. `把《寻秦记》发到 Kindle` — title remains exactly `寻秦记`.
+9. `/send Pride and Prejudice` — deterministic path works when AI is unavailable.
+10. Simulated AI failure — safe reply/no task.
+11. Simulated Telegram final-reply failure — Queue retry sends reply without creating another task.
+12. Duplicate assistant Queue delivery — one logical task maximum.
+13. Real image test — no receiver/private-field error.
+
+## Release gate
+
+This document describes the stabilization branch tracked by Issue #4 / PR #5.
+
+Do not merge PR #5 or call the project stable until the staging matrix in `docs/DEPLOYMENT.md` passes on the exact candidate HEAD.
