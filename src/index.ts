@@ -6,6 +6,7 @@ import { InternetArchivePublicSource } from "./adapters/internetarchive";
 import { ZLibrarySource, isZLibraryConfigured } from "./adapters/zlibrary";
 import { cancelTask, handleTelegramControlWebhook } from "./cancel";
 import { isFreeTierGuardEnabled, UsageGuard } from "./guard";
+import { withRelevanceGate } from "./relevance";
 import { TaskRepository } from "./repository";
 import { handleTelegramSettingsWebhook } from "./settings";
 import {
@@ -188,8 +189,6 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
             { status: 202 },
           );
         }
-        // A stale reservation can only exist if an earlier request died before
-        // task persistence. Remove it so the same client key can recover.
         await releaseIdempotencyKey(env, idempotency.key, existingId);
       }
     }
@@ -342,7 +341,7 @@ function sources(env: Env) {
     new GoogleBooksFreeSource(),
     new InternetArchivePublicSource(),
     ZLibrarySource.create(env),
-  ];
+  ].map(withRelevanceGate);
 }
 
 export default {
@@ -361,10 +360,6 @@ export default {
         } catch (error) {
           console.error("Telegram image queue job failed", message.body.sourceMessageId, error);
         }
-        // Image work is intentionally one-shot until a dedicated queue-job
-        // idempotency record exists; retrying after a post-side-effect error can
-        // create duplicate book tasks. The processor sends an explicit failure
-        // reply for ordinary recognition errors.
         message.ack();
         continue;
       }
