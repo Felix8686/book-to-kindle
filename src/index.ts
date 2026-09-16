@@ -198,32 +198,6 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   const repo = new TaskRepository(env.DB);
   const guard = new UsageGuard(env.DB);
 
-  // TEMPORARY STAGING ACCEPTANCE PROBE. Remove after Queue lease live testing.
-  // API_TOKEN protected + unavailable unless APP_ENV is exactly "staging".
-  if (request.method === "POST" && url.pathname === "/api/v1/_staging/queue/replay") {
-    if (env.APP_ENV !== "staging") {
-      return json({ error: "not_found" }, { status: 404 });
-    }
-
-    const body = await readJson(request);
-    const taskId = body && typeof body.taskId === "string" ? body.taskId.trim() : "";
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(taskId)) {
-      return json({ error: "invalid_task_id" }, { status: 400 });
-    }
-
-    const task = await repo.get(taskId);
-    if (!task) return json({ error: "not_found" }, { status: 404 });
-
-    try {
-      await env.TASK_QUEUE.send({ kind: "book", taskId });
-    } catch (error) {
-      console.error("Staging Queue replay enqueue failed", taskId, error);
-      return json({ error: "queue_unavailable" }, { status: 503 });
-    }
-
-    return json({ id: taskId, enqueued: true }, { status: 202 });
-  }
-
   if (request.method === "POST" && url.pathname === "/api/v1/tasks") {
     const check = await guard.checkCanCreateTask(env);
     if (!check.allowed) {
