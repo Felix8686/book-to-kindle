@@ -29,7 +29,7 @@ Current accepted status:
 - TASK_LEASE_ACQUISITION: PASS (LIVE-STAGING).
 - QUEUE_IDEMPOTENCY: PARTIAL (LIVE-STAGING). Active-lease replay blocking and expired-lease recovery still require a real Queue replay test.
 - R2_WORKFLOW_PUT_GET: PASS (LIVE-STAGING).
-- R2_CANCEL_CLEANUP: PASS (LIVE-STAGING).
+- R2_CANCEL_CLEANUP: PASS (LIVE-STAGING). A real staged Pride and Prejudice object was deleted on cancel and a remote Wrangler GET returned key-not-found.
 - R2_FAILURE_PATHS: NOT_RUN (LIVE-STAGING) for remaining missing/invalid/oversized/forced-PUT-failure cases.
 - VISION_QWEN: NOT_RUN (LIVE-STAGING).
 - GMAIL_FENCE_SIMULATED: PASS (CODE/SIMULATED).
