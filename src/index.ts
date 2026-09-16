@@ -4,6 +4,10 @@ import { GoogleBooksFreeSource } from "./adapters/googlebooks";
 import { GutendexSource } from "./adapters/gutendex";
 import { InternetArchivePublicSource } from "./adapters/internetarchive";
 import { ZLibrarySource, isZLibraryConfigured } from "./adapters/zlibrary";
+import {
+  handleTelegramAssistantWebhook,
+  processTelegramAssistantMessage,
+} from "./assistant-queue";
 import { cancelTask, handleTelegramControlWebhook } from "./cancel";
 import { isFreeTierGuardEnabled, UsageGuard } from "./guard";
 import { withRelevanceGate } from "./relevance";
@@ -162,6 +166,13 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       env,
     );
     if (controlResponse) return controlResponse;
+
+    const assistantResponse = await handleTelegramAssistantWebhook(
+      request.clone() as unknown as Request,
+      env,
+    );
+    if (assistantResponse) return assistantResponse;
+
     return handleTelegramWebhook(request, env);
   }
 
@@ -177,6 +188,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       defaultLanguage: "zh",
       delivery: isGmailConfigured(env) && env.KINDLE_EMAIL ? "gmail" : "not_configured",
       telegram: isTelegramConfigured(env) ? "configured" : "not_configured",
+      assistant: env.AI ? "queued_workers_ai" : "not_configured",
       vision: env.AI ? "workers_ai" : "not_configured",
     });
   }
@@ -389,6 +401,17 @@ export default {
     const delivery = isGmailConfigured(env) ? new GmailDelivery(env) : undefined;
 
     for (const message of batch.messages) {
+      if (message.body.kind === "telegram_assistant_text") {
+        try {
+          await processTelegramAssistantMessage(message.body, env);
+          message.ack();
+        } catch (error) {
+          console.error("Telegram assistant Queue job failed", message.body.updateId, error);
+          message.retry();
+        }
+        continue;
+      }
+
       if (message.body.kind === "telegram_image") {
         try {
           const imageEnv: Env = { ...env, AI: createReceiverSafeAi(env.AI) };
@@ -412,9 +435,6 @@ export default {
       }
 
       if (!acquired) {
-        // A concurrent delivery of the same Queue task already owns the lease.
-        // Acknowledge this duplicate message; the active owner or its own retry
-        // remains responsible for completion.
         message.ack();
         continue;
       }
