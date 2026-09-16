@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "./domain";
-import { decideAssistantAction, normalizeAssistantDecision } from "./assistant";
+import {
+  DEFAULT_ASSISTANT_MODEL,
+  decideAssistantAction,
+  normalizeAssistantDecision,
+} from "./assistant";
 
 const originalFetch = globalThis.fetch;
 
@@ -117,7 +121,7 @@ describe("assistant decision normalization", () => {
       async run(this: { marker: string }, model: string, inputs: Record<string, unknown>) {
         expect(this).toBe(ai);
         expect(this.marker).toBe("workers-ai-binding");
-        expect(model).toBe("@cf/meta/llama-3.1-8b-instruct-fast");
+        expect(model).toBe(DEFAULT_ASSISTANT_MODEL);
         expect(inputs).toHaveProperty("messages");
         return {
           response: JSON.stringify({
