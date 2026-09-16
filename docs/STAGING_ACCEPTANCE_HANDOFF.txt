@@ -1,7 +1,7 @@
 Book to Kindle staging acceptance handoff
 
 Branch: stabilize/book-to-kindle-v1
-Current cleanup HEAD baseline: 4c559209253174645e177fb7853d9e41e68427e7 or later
+Current cleanup HEAD baseline: b04cd770f7e2173653b469801d841e3ef712dfff or later
 PR: #5 (Draft; do not merge yet)
 
 Evidence levels:
