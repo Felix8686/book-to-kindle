@@ -1,0 +1,328 @@
+BOOK TO KINDLE — STAGING ACCEPTANCE HANDOFF
+
+Target repository: Felix8686/book-to-kindle
+Target branch: stabilize/book-to-kindle-v1
+Expected starting HEAD: 146751e417ee16ee6a97325125e5b6f35f14498b or a later commit on the same branch
+PR: #5
+Issue: #4
+
+MISSION
+
+Validate the stabilization branch in an isolated real Cloudflare staging environment. Do not modify main and do not deploy over production. Do not declare the project complete merely because CI passes.
+
+HARD SAFETY BOUNDARIES
+
+1. Never push or merge to main.
+2. Never deploy with wrangler.toml during this acceptance. Use wrangler.staging.toml only.
+3. Never apply migrations to the production D1 database.
+4. Never point the production Telegram bot at staging. Telegram permits one webhook per bot; changing it would steal production traffic. A dedicated staging bot/token is required for real Telegram tests.
+5. Do not print secret values. Secret presence may be reported by name only.
+6. Failure-injection tests must not repeatedly send real email/Kindle documents. Use local/mocked tests for destructive Gmail failure cases. Only one controlled real last-mile Kindle delivery is required.
+7. For the real last-mile delivery, use a legitimate/public-domain title such as Pride and Prejudice from an open/public-domain source. Do not use copyrighted-source acquisition as acceptance evidence.
+8. If any staging resource resolves to a production resource ID/name, STOP before mutation and report BLOCKED.
+
+PHASE 0 — SYNC AND IMMUTABILITY CHECK
+
+Command:
+git fetch origin
+
+Purpose: refresh remote refs. Risk: read-only network operation.
+
+Command:
+git checkout stabilize/book-to-kindle-v1
+
+Purpose: switch to the stabilization branch. Risk: do not discard uncommitted local work; if the worktree is dirty, stop and report it instead of resetting.
+
+Command:
+git pull --ff-only origin stabilize/book-to-kindle-v1
+
+Purpose: ensure the local branch exactly follows GitHub without creating a merge commit. Risk: stops rather than rewriting history if the branch diverged.
+
+Record:
+git rev-parse HEAD
+git status --short --branch
+
+PASS condition: correct branch, clean worktree, HEAD matches GitHub branch head.
+
+PHASE 1 — LOCAL/CI-EQUIVALENT GATE
+
+Command:
+npm install --no-audit --no-fund
+
+Purpose: install the repository-declared dependencies. Risk: modifies node_modules only; no cloud mutation.
+
+Command:
+npm run typecheck
+
+Purpose: compile-time TypeScript validation. Risk: read-only with respect to cloud resources.
+
+Command:
+npm test
+
+Purpose: run the automated regression suite, including entity grounding, source relevance, Gmail fence, Workers AI receiver, vision adaptation, and assistant webhook idempotency tests. Risk: tests must remain isolated/mocked and must not send real Kindle documents.
+
+Command:
+npm run db:migrate:local
+
+Purpose: prove migrations 0001 through 0013 can rebuild an empty local D1 database. Risk: local Wrangler state only; do not replace this command with --remote here.
+
+PASS condition: all four commands exit 0.
+
+PHASE 2 — VERIFY STAGING RESOURCE ISOLATION BEFORE ANY REMOTE WRITE
+
+Inspect wrangler.staging.toml and compare it with wrangler.toml.
+
+Expected staging resources:
+Worker: book-to-kindle-staging
+D1: book-to-kindle-staging / beaac40b-eafd-475a-b92a-f75d1d74a8c2
+R2: book-to-kindle-files-staging
+Queue: book-to-kindle-tasks-staging
+DLQ: book-to-kindle-dlq-staging
+APP_ENV: staging
+
+Expected production resources must be different:
+Worker: book-to-kindle
+D1 ID: 1297e26c-c5b5-42c3-929d-bf0dfd7b8992
+R2: book-to-kindle-files
+Queue: book-to-kindle-tasks
+
+Command:
+npx wrangler whoami
+
+Purpose: verify Cloudflare authentication and account context. Risk: read-only.
+
+Command:
+npx wrangler secret list --config wrangler.staging.toml
+
+Purpose: list staging secret names without exposing values. Risk: read-only.
+
+Required secret names for full staging acceptance:
+API_TOKEN
+KINDLE_EMAIL
+GMAIL_CLIENT_ID
+GMAIL_CLIENT_SECRET
+GMAIL_REFRESH_TOKEN
+GMAIL_FROM_EMAIL
+TELEGRAM_BOT_TOKEN
+TELEGRAM_WEBHOOK_SECRET
+TELEGRAM_ALLOWED_USER_IDS
+
+ZLibrary credentials are not required to prove the public-domain last-mile path. If present, do not expose values.
+
+Critical check: establish whether TELEGRAM_BOT_TOKEN belongs to a dedicated staging bot. If this cannot be proven without revealing the token, report the bot username or other non-secret identifier obtained through Telegram getMe. If it is the production bot, STOP before changing any webhook.
+
+PASS condition: all staging resources are isolated and a dedicated staging Telegram bot exists.
+
+PHASE 3 — APPLY STAGING MIGRATIONS
+
+Command:
+npx wrangler d1 migrations apply book-to-kindle-staging --remote --config wrangler.staging.toml
+
+Purpose: bring only the staging D1 schema through migrations 0001–0013. Risk: remote database mutation, but staging-only. Do not run against book-to-kindle production.
+
+After migration, inspect the staging schema and migration state with Wrangler D1 read-only queries. Confirm at minimum these stabilization tables exist:
+telegram_conversation_messages
+delivery_fences
+api_idempotency
+task_execution_leases
+telegram_assistant_jobs
+
+PASS condition: migration command exits 0 and required staging tables exist.
+
+PHASE 4 — DEPLOY EXACT STABILIZATION HEAD TO STAGING
+
+Command:
+npx wrangler deploy --config wrangler.staging.toml
+
+Purpose: deploy the branch to the isolated staging Worker. Risk: changes staging Worker code only. Record the Worker URL plus version/deployment identifiers reported by Wrangler.
+
+Health check:
+curl -fsS https://<staging-worker-host>/health
+
+Expected categories:
+ok=true
+service=book-to-kindle
+environment=staging
+assistant=queued_workers_ai
+vision=workers_ai
+telegram=configured
+delivery=gmail
+
+Record the exact health response with secrets redacted.
+
+PHASE 5 — CONFIGURE ONLY THE STAGING TELEGRAM BOT
+
+Read the current staging bot webhook first with Telegram getWebhookInfo. Record only the URL/status metadata, never the token.
+
+Set the dedicated staging bot webhook to:
+https://<staging-worker-host>/telegram/webhook
+
+Use the existing staging TELEGRAM_WEBHOOK_SECRET as secret_token.
+
+Re-run getWebhookInfo and verify the URL points to the staging Worker and has no pending error.
+
+Do not touch the production bot webhook.
+
+PHASE 6 — REAL ENTITY FIDELITY AND ROUTING MATRIX
+
+Use the dedicated staging Telegram bot and the actual configured Workers AI model. For each case, capture the user input, bot reply, resulting D1 task/job rows, and whether a book task was created.
+
+Case A1:
+纳尼亚传奇
+
+Mandatory acceptance: the model may only use exact title 纳尼亚传奇, or ask for clarification without creating a task. Any mutated title such as 纽里亚主事书 is an immediate FAIL.
+
+Case A2:
+哈利波特
+
+Mandatory acceptance: no hallucinated replacement title. If treated as a series/ambiguous request, clarification or a grounded response is acceptable.
+
+Case A3:
+把《天龙八部》发到 Kindle
+
+Mandatory acceptance: task query must be exactly 天龙八部.
+
+Case A4:
+倪匡
+
+Mandatory acceptance: must not blindly create a book task from an author name.
+
+Case A5:
+倪匡有哪些值得看？
+
+Mandatory acceptance: author entity must remain 倪匡 and bibliographic results must come from code-backed catalog data.
+
+Case A6/A7 contextual pair:
+First obtain a numbered grounded book list from a normal author/catalog interaction.
+Then send:
+第二本怎么样？
+Then send:
+第二本发到 Kindle
+
+Mandatory acceptance: the referenced title must be one that appeared in bounded conversation history; no invented title.
+
+Case A8:
+刚才那本发成功了吗？
+
+Mandatory acceptance: status route only; no new book task.
+
+Also test explicit fallback command:
+/send Pride and Prejudice
+
+Mandatory acceptance: explicit /send can create a task without relying on free-form assistant interpretation.
+
+PHASE 7 — REAL TELEGRAM IMAGE / QWEN 3.8
+
+Send one clear known book cover to the staging bot. Prefer a public-domain title; the previously validated 1984 / George Orwell cover may be used only for recognition, not for copyrighted acquisition.
+
+Collect Worker logs showing the image path executes without receiver/private-field errors. Confirm the user-facing recognition/candidate flow is normal.
+
+The implementation must route the legacy vision call through src/workers-ai.ts to actual model @cf/qwen/qwen3.8-27b.
+
+PASS condition: recognition works or safely asks user to select/clarify; no duplicate task from one image update.
+
+PHASE 8 — RELIABILITY / FAILURE-INJECTION GATES
+
+Run destructive/failure tests locally or against isolated staging only. Do not cause repeated real Gmail/Kindle sends.
+
+Required evidence:
+
+1. Duplicate free-form Telegram update does not create two telegram_assistant_jobs or two logical book tasks.
+2. Assistant Queue enqueue failure rolls back both assistant job and Telegram update claim; retry succeeds.
+3. Duplicate/replayed book Queue messages do not execute concurrently while an active task_execution_leases row exists.
+4. Expired book lease can be reclaimed after simulated hard crash.
+5. HTTP POST /api/v1/tasks with the same Idempotency-Key returns the same logical task rather than creating two tasks.
+6. Injected HTTP Queue enqueue failure returns 503 and leaves no orphan task/key reservation.
+7. Irrelevant source candidates are rejected before ranking.
+8. Invalid EPUB/PDF signature, oversized download, source failure, R2 PUT failure and missing staged object do not reach Gmail send.
+9. Gmail fence: accepted receipt replay performs no second Gmail send.
+10. Gmail fence: uncertain/network-lost send becomes unknown and automatic resend is blocked.
+11. Simulated crash after Gmail acceptance but before TaskRecord update recovers the persisted accepted receipt rather than resending.
+12. Telegram final sendMessage failure leaves the assistant job retryable/diagnosable and does not duplicate its logical task.
+
+Automated tests may supply evidence for cases already covered, but staging-specific state/Queue behavior should be demonstrated where practical.
+
+PHASE 9 — ONE REAL LEGITIMATE END-TO-END KINDLE DELIVERY
+
+Use a public-domain work, preferably Pride and Prejudice, from an open/public-domain source. Perform exactly one real end-to-end acceptance delivery unless a retry is clearly proven to have occurred before Gmail send.
+
+Required observed chain:
+Telegram staging bot
+-> assistant/book task
+-> resolver/source
+-> candidate selection if needed
+-> valid download
+-> staging R2
+-> Gmail
+-> actual Kindle receipt
+-> Telegram delivered notification
+
+Record task ID, selected source name, task state transitions, Gmail message ID if available, and confirmation that the document appeared on Kindle. Do not record credentials.
+
+PHASE 10 — FINAL STAGING REPORT
+
+Return one report with exactly these sections:
+
+OVERALL: PASS / PARTIAL / FAIL / BLOCKED
+
+HEAD
+- branch
+- commit SHA
+- clean/dirty worktree
+
+CI / LOCAL
+- typecheck
+- tests, including total test count
+- local migration rebuild
+
+STAGING RESOURCES
+- Worker name/URL/version
+- D1 name/id and migration state
+- R2/Queue/DLQ names
+- staging Telegram bot identity
+- secret names present/missing, values never shown
+
+ENTITY / ROUTING MATRIX
+- each A1–A8 input
+- actual resolved entity/action
+- task created yes/no
+- PASS/FAIL
+
+IMAGE
+- actual model path observed
+- recognition result
+- PASS/FAIL
+
+RELIABILITY MATRIX
+- each required fault/replay case
+- observed final state
+- duplicate side effect yes/no
+- PASS/FAIL
+
+REAL LAST-MILE
+- public-domain title used
+- task id
+- source
+- Gmail accepted yes/no
+- Kindle received yes/no
+- Telegram delivered notification yes/no
+
+SCHEMA
+- 0001–0013 applied/rebuildable yes/no
+- required stabilization tables present yes/no
+
+OPEN BLOCKERS
+- only concrete remaining blockers; do not hide failures
+
+RECOMMENDATION
+- If every mandatory staging gate passes: report READY_FOR_CHATGPT_FINAL_REVIEW. Do not merge main yourself.
+- Otherwise: report NOT_READY and identify the smallest reproducible failure with evidence.
+
+STOP CONDITIONS
+
+Stop immediately and report BLOCKED if:
+- staging config points to production D1/R2/Queue;
+- only the production Telegram bot is available;
+- required staging credentials are missing and the next test would require them;
+- a test would require destructive mutation of production;
+- a real Gmail side effect is uncertain. In that case inspect delivery_fences/task state before any retry; never blindly resend.
