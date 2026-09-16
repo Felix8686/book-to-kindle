@@ -96,7 +96,19 @@ export interface TelegramImageQueueMessage {
   mimeType?: string;
 }
 
-export type TaskQueueMessage = BookTaskQueueMessage | TelegramImageQueueMessage;
+export interface TelegramAssistantTextQueueMessage {
+  kind: "telegram_assistant_text";
+  updateId: number;
+  chatId: string;
+  userId: string;
+  sourceMessageId: number;
+  text: string;
+}
+
+export type TaskQueueMessage =
+  | BookTaskQueueMessage
+  | TelegramImageQueueMessage
+  | TelegramAssistantTextQueueMessage;
 
 export interface SourceAdapter {
   name: string;
