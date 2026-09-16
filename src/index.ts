@@ -61,6 +61,55 @@ async function readJson(request: Request): Promise<Record<string, unknown> | nul
   }
 }
 
+function readIdempotencyKey(request: Request): { key?: string; error?: string } {
+  const raw = request.headers.get("idempotency-key");
+  if (raw === null) return {};
+  const key = raw.trim();
+  if (!key || key.length > 128) {
+    return { error: "Idempotency-Key must be between 1 and 128 characters." };
+  }
+  return { key };
+}
+
+async function mappedTaskId(env: Env, key: string): Promise<string | null> {
+  const row = await env.DB
+    .prepare(`SELECT task_id FROM api_idempotency WHERE idempotency_key = ?1`)
+    .bind(key)
+    .first<Record<string, unknown>>();
+  return row?.task_id ? String(row.task_id) : null;
+}
+
+async function reserveIdempotencyKey(env: Env, key: string, taskId: string): Promise<boolean> {
+  const result = await env.DB
+    .prepare(
+      `INSERT INTO api_idempotency (idempotency_key, task_id, created_at)
+       VALUES (?1, ?2, ?3)
+       ON CONFLICT(idempotency_key) DO NOTHING`,
+    )
+    .bind(key, taskId, new Date().toISOString())
+    .run();
+  return Number(result.meta.changes ?? 0) > 0;
+}
+
+async function releaseIdempotencyKey(env: Env, key: string, taskId: string): Promise<void> {
+  await env.DB
+    .prepare(`DELETE FROM api_idempotency WHERE idempotency_key = ?1 AND task_id = ?2`)
+    .bind(key, taskId)
+    .run();
+}
+
+async function cleanupFailedHttpTask(env: Env, taskId: string, idempotencyKey?: string): Promise<void> {
+  const statements = [env.DB.prepare(`DELETE FROM tasks WHERE id = ?1`).bind(taskId)];
+  if (idempotencyKey) {
+    statements.push(
+      env.DB
+        .prepare(`DELETE FROM api_idempotency WHERE idempotency_key = ?1 AND task_id = ?2`)
+        .bind(idempotencyKey, taskId),
+    );
+  }
+  await env.DB.batch(statements);
+}
+
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
@@ -124,11 +173,77 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       );
     }
 
-    const id = crypto.randomUUID();
-    await repo.create(id, bookRequest);
-    await guard.increment("tasks_created");
-    await env.TASK_QUEUE.send({ kind: "book", taskId: id });
+    const idempotency = readIdempotencyKey(request);
+    if (idempotency.error) {
+      return json({ error: "invalid_idempotency_key", message: idempotency.error }, { status: 400 });
+    }
 
+    if (idempotency.key) {
+      const existingId = await mappedTaskId(env, idempotency.key);
+      if (existingId) {
+        const existingTask = await repo.get(existingId);
+        if (existingTask) {
+          return json(
+            { id: existingTask.id, status: existingTask.status, idempotentReplay: true },
+            { status: 202 },
+          );
+        }
+        // A stale reservation can only exist if an earlier request died before
+        // task persistence. Remove it so the same client key can recover.
+        await releaseIdempotencyKey(env, idempotency.key, existingId);
+      }
+    }
+
+    const id = crypto.randomUUID();
+    if (idempotency.key) {
+      const reserved = await reserveIdempotencyKey(env, idempotency.key, id);
+      if (!reserved) {
+        const winnerId = await mappedTaskId(env, idempotency.key);
+        if (winnerId) {
+          const winner = await repo.get(winnerId);
+          if (winner) {
+            return json(
+              { id: winner.id, status: winner.status, idempotentReplay: true },
+              { status: 202 },
+            );
+          }
+        }
+        return json(
+          {
+            error: "idempotency_request_in_progress",
+            message: "Another request with the same Idempotency-Key is still being committed. Retry shortly.",
+          },
+          { status: 409, headers: { "retry-after": "1" } },
+        );
+      }
+    }
+
+    try {
+      await repo.create(id, bookRequest);
+    } catch (error) {
+      if (idempotency.key) await releaseIdempotencyKey(env, idempotency.key, id);
+      throw error;
+    }
+
+    try {
+      await env.TASK_QUEUE.send({ kind: "book", taskId: id });
+    } catch (error) {
+      try {
+        await cleanupFailedHttpTask(env, id, idempotency.key);
+      } catch (cleanupError) {
+        console.error("Could not clean up failed HTTP task enqueue", id, cleanupError);
+      }
+      console.error("HTTP task queue enqueue failed", id, error);
+      return json(
+        {
+          error: "queue_unavailable",
+          message: "The task was not accepted because Queue enqueue failed. It is safe to retry.",
+        },
+        { status: 503, headers: { "retry-after": "2" } },
+      );
+    }
+
+    await guard.increment("tasks_created");
     return json({ id, status: "queued" }, { status: 202 });
   }
 
@@ -187,6 +302,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const selected = task.candidates.find((candidate) => candidate.id === candidateId);
     if (!selected) return json({ error: "candidate_not_found" }, { status: 404 });
 
+    const originalCandidates = task.candidates;
     await repo.update(task.id, {
       status: "queued",
       candidates: null,
@@ -197,7 +313,22 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     if (String(latest?.status) === "cancelled") {
       return json({ error: "task_cancelled", id: task.id }, { status: 409 });
     }
-    await env.TASK_QUEUE.send({ kind: "book", taskId: task.id });
+
+    try {
+      await env.TASK_QUEUE.send({ kind: "book", taskId: task.id });
+    } catch (error) {
+      console.error("Selection queue enqueue failed", task.id, error);
+      await repo.update(task.id, {
+        status: "needs_selection",
+        candidates: originalCandidates,
+        selectedCandidate: null,
+        errorMessage: "Selection was saved but Queue enqueue failed; please choose again.",
+      });
+      return json(
+        { error: "queue_unavailable", id: task.id, status: "needs_selection" },
+        { status: 503, headers: { "retry-after": "2" } },
+      );
+    }
 
     return json({ id: task.id, status: "queued", selectedCandidate: selected }, { status: 202 });
   }
@@ -230,6 +361,10 @@ export default {
         } catch (error) {
           console.error("Telegram image queue job failed", message.body.sourceMessageId, error);
         }
+        // Image work is intentionally one-shot until a dedicated queue-job
+        // idempotency record exists; retrying after a post-side-effect error can
+        // create duplicate book tasks. The processor sends an explicit failure
+        // reply for ordinary recognition errors.
         message.ack();
         continue;
       }
