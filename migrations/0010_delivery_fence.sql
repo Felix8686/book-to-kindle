@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS delivery_fences (
   state TEXT NOT NULL CHECK (state IN ('started', 'accepted', 'unknown')),
   started_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  provider_message_id TEXT
+  provider_message_id TEXT,
+  provider_thread_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_delivery_fences_state
