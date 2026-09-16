@@ -7,7 +7,7 @@ import {
 } from "./catalog";
 import { runWorkersAi } from "./workers-ai";
 
-export const DEFAULT_ASSISTANT_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast" as const;
+export const DEFAULT_ASSISTANT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast" as const;
 const DEFAULT_HISTORY_LIMIT = 12;
 const MAX_HISTORY_LIMIT = 12;
 const MAX_HISTORY_CONTENT_CHARS = 1600;
@@ -51,6 +51,12 @@ export type AssistantRoute =
       confidence: number;
     };
 
+const FALLBACK_TEXT =
+  "我不太确定你的意思。你可以继续说明想了解哪位作者、哪本书，或者明确说要把哪本书发送到 Kindle。";
+
+const GROUNDING_FAILURE_TEXT =
+  "我没有足够依据确认你指的是哪本书或哪位作者，所以没有创建 Kindle 任务。请直接写出书名，或继续说明你的意思。";
+
 const SYSTEM_PROMPT = [
   "你是 Book to Kindle 的自然语言理解层。你的职责是理解用户、上下文和指代，然后选择正确动作；确定性业务和书目事实由代码工具完成。",
   "绝不能把所有文字默认当作书名，也不要用模型记忆编造作者作品、版本、出版信息或书目事实。",
@@ -62,14 +68,14 @@ const SYSTEM_PROMPT = [
   "4. book：只有当用户明确要查找/获取并发送一本具体书到 Kindle 时使用。",
   "5. status：用户询问最近 Kindle 任务是否发送成功、进度、结果或当前状态时使用。",
   "",
-  "关键规则：",
-  "- 人名、作者名、流派名、系列名、主题词、普通问句本身都不是发送任务。比如用户只发‘倪匡’，通常 reply。",
-  "- ‘倪匡有哪些值得看？’必须 author_works，author=倪匡；不要自己列作品。",
-  "- 如果上一条助手回复是编号书单，用户说‘第二本怎么样？’，必须从最近历史取出第 2 本的准确书名并 book_info。",
-  "- 如果上一条助手回复是编号书单，用户说‘第二本发到 Kindle’，必须从最近历史取出第 2 本的准确书名并 book。",
+  "实体保真规则：",
+  "- title 和 author 必须逐字来自当前用户消息或最近对话中已经出现的具体实体。不得纠错、翻译、改写、补全或猜测。",
+  "- 用户直接输入书名时，原始书名就是最高优先级实体。例如输入‘纳尼亚传奇’，title 必须保持‘纳尼亚传奇’，不能改成发音或字形相近的其他文字。",
+  "- 如果上一条助手回复是编号书单，用户说‘第二本怎么样？’，只能使用历史中第 2 本已经出现的准确书名并 book_info。",
+  "- 如果上一条助手回复是编号书单，用户说‘第二本发到 Kindle’，只能使用历史中第 2 本已经出现的准确书名并 book。",
   "- 用户说‘刚才那本发成功了吗？’、‘到哪一步了？’、‘发过去没有？’，必须 status，绝不能再次创建 book。",
   "- 对‘第二本’、‘刚才那本’、‘这本’等指代，优先利用最近对话解析；无法可靠确定时 reply 追问，不得猜。",
-  "- book 和 book_info 的 title 必须来自用户消息或最近历史中已经出现的具体书名，禁止编造。",
+  "- 人名、作者名、流派名、系列名、主题词、普通问句本身都不是发送任务。",
   "- 不确定用户是在讨论一本书还是要发送它时，必须 reply 或 book_info，不能擅自创建发送任务。",
   "- reply 要直接面向用户，不要解释内部分类、JSON 或工具机制。默认使用用户当前消息的语言。",
   "",
@@ -113,7 +119,7 @@ function normalizeBook(raw: unknown): BookRequest | null {
 export function normalizeAssistantDecision(value: unknown): AssistantRoute {
   const fallback: AssistantDecision = {
     kind: "reply",
-    text: "我不太确定你的意思。你可以继续说明想了解哪位作者、哪本书，或者明确说要把哪本书发送到 Kindle。",
+    text: FALLBACK_TEXT,
     confidence: 0,
   };
 
@@ -136,12 +142,7 @@ export function normalizeAssistantDecision(value: unknown): AssistantRoute {
     if (!author || confidence < 0.55) {
       return { kind: "reply", text: reply || fallback.text, confidence };
     }
-    return {
-      kind: "author_works",
-      author,
-      text: reply,
-      confidence,
-    };
+    return { kind: "author_works", author, text: reply, confidence };
   }
 
   if (action === "book_info") {
@@ -149,41 +150,76 @@ export function normalizeAssistantDecision(value: unknown): AssistantRoute {
     if (!request || confidence < 0.55) {
       return { kind: "reply", text: reply || fallback.text, confidence };
     }
-    return {
-      kind: "book_info",
-      request,
-      text: reply,
-      confidence,
-    };
+    return { kind: "book_info", request, text: reply, confidence };
   }
 
   if (action === "book") {
     const request = normalizeBook(raw.book);
     if (!request || confidence < 0.6) {
-      return {
-        kind: "reply",
-        text: reply || fallback.text,
-        confidence,
-      };
+      return { kind: "reply", text: reply || fallback.text, confidence };
     }
-
-    return {
-      kind: "book",
-      request,
-      text: reply,
-      confidence,
-    };
+    return { kind: "book", request, text: reply, confidence };
   }
 
   if (action === "reply") {
-    return {
-      kind: "reply",
-      text: reply || fallback.text,
-      confidence,
-    };
+    return { kind: "reply", text: reply || fallback.text, confidence };
   }
 
   return fallback;
+}
+
+function normalizeEvidence(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/[\p{P}\p{Z}\p{S}]+/gu, "")
+    .trim();
+}
+
+function isGroundedEntity(
+  entity: string | undefined,
+  text: string,
+  history: AssistantHistoryMessage[],
+): boolean {
+  if (!entity) return true;
+  const target = normalizeEvidence(entity);
+  if (!target) return false;
+  const evidence = [text, ...history.map((message) => message.content)];
+  return evidence.some((item) => normalizeEvidence(item).includes(target));
+}
+
+/**
+ * AI may classify intent, but it may not silently rewrite user-visible entities.
+ * Any title/author that drives deterministic tools must be grounded in the current
+ * message or bounded conversation history. This converts model hallucination or
+ * glyph corruption into a clarification instead of a wrong search/delivery task.
+ */
+export function groundAssistantRoute(
+  route: AssistantRoute,
+  text: string,
+  history: AssistantHistoryMessage[],
+): AssistantRoute {
+  if (route.kind === "author_works") {
+    if (!isGroundedEntity(route.author, text, history)) {
+      return { kind: "reply", text: GROUNDING_FAILURE_TEXT, confidence: 0 };
+    }
+    return route;
+  }
+
+  if (route.kind !== "book" && route.kind !== "book_info") return route;
+
+  if (!isGroundedEntity(route.request.query, text, history)) {
+    return { kind: "reply", text: GROUNDING_FAILURE_TEXT, confidence: 0 };
+  }
+
+  const request: BookRequest = { ...route.request };
+  if (request.author && !isGroundedEntity(request.author, text, history)) {
+    // An ungrounded author should never poison an otherwise grounded title search.
+    // Dropping it is safer than accepting invented bibliographic data.
+    delete request.author;
+  }
+
+  return { ...route, request };
 }
 
 function parseAiResponse(raw: unknown): unknown {
@@ -192,8 +228,9 @@ function parseAiResponse(raw: unknown): unknown {
     : raw;
 
   if (typeof response === "string") {
+    const trimmed = response.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
     try {
-      return JSON.parse(response);
+      return JSON.parse(trimmed);
     } catch {
       return null;
     }
@@ -239,10 +276,10 @@ export async function decideAssistantAction(
   history: AssistantHistoryMessage[] = [],
 ): Promise<AssistantDecision> {
   const model = env.ASSISTANT_MODEL?.trim() || DEFAULT_ASSISTANT_MODEL;
-
+  const safeHistory = sanitizeHistory(history);
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
-    ...sanitizeHistory(history),
+    ...safeHistory,
     { role: "user", content: text.trim().slice(0, MAX_HISTORY_CONTENT_CHARS) },
   ];
 
@@ -277,8 +314,9 @@ export async function decideAssistantAction(
     },
   });
 
-  const route = normalizeAssistantDecision(parseAiResponse(raw));
-  return executeCodeRoute(route);
+  const normalized = normalizeAssistantDecision(parseAiResponse(raw));
+  const grounded = groundAssistantRoute(normalized, text, safeHistory);
+  return executeCodeRoute(grounded);
 }
 
 export class TelegramConversationRepository {
