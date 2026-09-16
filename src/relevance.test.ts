@@ -64,4 +64,25 @@ describe("candidate relevance gate", () => {
       ),
     ).toBe(true);
   });
+
+  it("accepts a bibliographic family-name-first author ordering", () => {
+    const austenContext: BookSearchContext = {
+      request: { query: "Pride and Prejudice", author: "Jane Austen" },
+      preferredLanguage: "en",
+      identity: {
+        canonicalTitle: "Pride and Prejudice",
+        authors: ["Jane Austen"],
+        titles: [{ title: "Pride and Prejudice", language: "en", source: "openlibrary" }],
+        identifiers: {},
+      },
+      queryVariants: ["Pride and Prejudice"],
+    };
+
+    expect(
+      isRelevantCandidate(
+        candidate({ title: "Pride and Prejudice", author: "Austen, Jane" }),
+        austenContext,
+      ),
+    ).toBe(true);
+  });
 });
