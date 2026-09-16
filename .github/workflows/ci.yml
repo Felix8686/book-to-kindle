@@ -25,3 +25,6 @@ jobs:
 
       - name: Run automated tests
         run: npm test
+
+      - name: Rebuild D1 schema from repository migrations
+        run: npm run db:migrate:local

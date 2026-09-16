@@ -139,6 +139,10 @@ async function claimTelegramUpdate(env: Env, updateId: number): Promise<boolean>
   return Number(result.meta.changes ?? 0) > 0;
 }
 
+async function releaseTelegramUpdate(env: Env, updateId: number): Promise<void> {
+  await env.DB.prepare(`DELETE FROM telegram_updates WHERE update_id = ?1`).bind(updateId).run();
+}
+
 function languageCommand(text: string): "zh" | "en" | "invalid" | null {
   const slash = text.match(/^\/language(?:@\w+)?(?:\s+(.+))?$/i);
   const chinese = text.match(/^\/语言(?:\s+(.+))?$/u);
@@ -178,42 +182,54 @@ export async function handleTelegramSettingsWebhook(
   if (!isAllowedUser(env, userId)) return null;
   if (!(await claimTelegramUpdate(env, update.update_id))) return new Response("ok");
 
-  const repo = new UserSettingsRepository(env.DB);
-  if (isSettings) {
-    const settings = await repo.get(userId);
+  try {
+    const repo = new UserSettingsRepository(env.DB);
+    if (isSettings) {
+      const settings = await repo.get(userId);
+      await sendTelegramMessage(
+        env,
+        String(message.chat.id),
+        [
+          "Book to Kindle 设置",
+          "",
+          `默认书籍语言：${settings.defaultLanguage === "zh" ? "中文优先" : "英文优先"}`,
+          `默认格式：${settings.preferredFormat.toUpperCase()}`,
+          "",
+          "修改语言：/language zh 或 /language en",
+          "单条消息中的“中文/英文”会临时覆盖默认值，但不会修改这里的设置。",
+        ].join("\n"),
+        message.message_id,
+      );
+      return new Response("ok");
+    }
+
+    if (requestedLanguage === null || requestedLanguage === "invalid") {
+      await sendTelegramMessage(
+        env,
+        String(message.chat.id),
+        "语言参数无效。请使用 /language zh 或 /language en，也可以输入 /语言 中文 或 /语言 英文。",
+        message.message_id,
+      );
+      return new Response("ok");
+    }
+
+    // The write is idempotent. If Telegram reply delivery fails, releasing the
+    // update claim allows Telegram to retry safely and send the missing reply.
+    const settings = await repo.setLanguage(userId, requestedLanguage);
     await sendTelegramMessage(
       env,
       String(message.chat.id),
-      [
-        "Book to Kindle 设置",
-        "",
-        `默认书籍语言：${settings.defaultLanguage === "zh" ? "中文优先" : "英文优先"}`,
-        `默认格式：${settings.preferredFormat.toUpperCase()}`,
-        "",
-        "修改语言：/language zh 或 /language en",
-        "单条消息中的“中文/英文”会临时覆盖默认值，但不会修改这里的设置。",
-      ].join("\n"),
+      `默认书籍语言已改为：${settings.defaultLanguage === "zh" ? "中文优先" : "英文优先"}。`,
       message.message_id,
     );
     return new Response("ok");
+  } catch (error) {
+    try {
+      await releaseTelegramUpdate(env, update.update_id);
+    } catch (releaseError) {
+      console.error("Could not release failed settings update claim", update.update_id, releaseError);
+    }
+    console.error("Telegram settings update failed", update.update_id, error);
+    return new Response("temporary_failure", { status: 500 });
   }
-
-  if (requestedLanguage === null || requestedLanguage === "invalid") {
-    await sendTelegramMessage(
-      env,
-      String(message.chat.id),
-      "语言参数无效。请使用 /language zh 或 /language en，也可以输入 /语言 中文 或 /语言 英文。",
-      message.message_id,
-    );
-    return new Response("ok");
-  }
-
-  const settings = await repo.setLanguage(userId, requestedLanguage);
-  await sendTelegramMessage(
-    env,
-    String(message.chat.id),
-    `默认书籍语言已改为：${settings.defaultLanguage === "zh" ? "中文优先" : "英文优先"}。`,
-    message.message_id,
-  );
-  return new Response("ok");
 }

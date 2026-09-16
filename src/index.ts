@@ -4,8 +4,13 @@ import { GoogleBooksFreeSource } from "./adapters/googlebooks";
 import { GutendexSource } from "./adapters/gutendex";
 import { InternetArchivePublicSource } from "./adapters/internetarchive";
 import { ZLibrarySource, isZLibraryConfigured } from "./adapters/zlibrary";
+import {
+  handleTelegramAssistantWebhook,
+  processTelegramAssistantMessage,
+} from "./assistant-queue";
 import { cancelTask, handleTelegramControlWebhook } from "./cancel";
 import { isFreeTierGuardEnabled, UsageGuard } from "./guard";
+import { withRelevanceGate } from "./relevance";
 import { TaskRepository } from "./repository";
 import { handleTelegramSettingsWebhook } from "./settings";
 import {
@@ -13,9 +18,11 @@ import {
   isTelegramConfigured,
   notifyTelegramTaskState,
   processTelegramImageMessage,
-  processTelegramSemanticText,
 } from "./telegram";
+import { createReceiverSafeAi } from "./workers-ai";
 import { processTask } from "./workflow";
+
+const TASK_EXECUTION_LEASE_MS = 15 * 60 * 1000;
 
 function json(data: unknown, init: ResponseInit = {}): Response {
   const headers = new Headers(init.headers);
@@ -61,6 +68,89 @@ async function readJson(request: Request): Promise<Record<string, unknown> | nul
   }
 }
 
+function readIdempotencyKey(request: Request): { key?: string; error?: string } {
+  const raw = request.headers.get("idempotency-key");
+  if (raw === null) return {};
+  const key = raw.trim();
+  if (!key || key.length > 128) {
+    return { error: "Idempotency-Key must be between 1 and 128 characters." };
+  }
+  return { key };
+}
+
+async function mappedTaskId(env: Env, key: string): Promise<string | null> {
+  const row = await env.DB
+    .prepare(`SELECT task_id FROM api_idempotency WHERE idempotency_key = ?1`)
+    .bind(key)
+    .first<Record<string, unknown>>();
+  return row?.task_id ? String(row.task_id) : null;
+}
+
+async function reserveIdempotencyKey(env: Env, key: string, taskId: string): Promise<boolean> {
+  const result = await env.DB
+    .prepare(
+      `INSERT INTO api_idempotency (idempotency_key, task_id, created_at)
+       VALUES (?1, ?2, ?3)
+       ON CONFLICT(idempotency_key) DO NOTHING`,
+    )
+    .bind(key, taskId, new Date().toISOString())
+    .run();
+  return Number(result.meta.changes ?? 0) > 0;
+}
+
+async function releaseIdempotencyKey(env: Env, key: string, taskId: string): Promise<void> {
+  await env.DB
+    .prepare(`DELETE FROM api_idempotency WHERE idempotency_key = ?1 AND task_id = ?2`)
+    .bind(key, taskId)
+    .run();
+}
+
+async function cleanupFailedHttpTask(env: Env, taskId: string, idempotencyKey?: string): Promise<void> {
+  const statements = [env.DB.prepare(`DELETE FROM tasks WHERE id = ?1`).bind(taskId)];
+  if (idempotencyKey) {
+    statements.push(
+      env.DB
+        .prepare(`DELETE FROM api_idempotency WHERE idempotency_key = ?1 AND task_id = ?2`)
+        .bind(idempotencyKey, taskId),
+    );
+  }
+  await env.DB.batch(statements);
+}
+
+async function tryAcquireTaskExecutionLease(
+  env: Env,
+  taskId: string,
+  leaseToken: string,
+): Promise<boolean> {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const leaseUntil = new Date(now.getTime() + TASK_EXECUTION_LEASE_MS).toISOString();
+  const result = await env.DB
+    .prepare(
+      `INSERT INTO task_execution_leases (task_id, lease_token, lease_until, updated_at)
+       VALUES (?1, ?2, ?3, ?4)
+       ON CONFLICT(task_id) DO UPDATE SET
+         lease_token = excluded.lease_token,
+         lease_until = excluded.lease_until,
+         updated_at = excluded.updated_at
+       WHERE task_execution_leases.lease_until <= ?4`,
+    )
+    .bind(taskId, leaseToken, leaseUntil, nowIso)
+    .run();
+  return Number(result.meta.changes ?? 0) > 0;
+}
+
+async function releaseTaskExecutionLease(
+  env: Env,
+  taskId: string,
+  leaseToken: string,
+): Promise<void> {
+  await env.DB
+    .prepare(`DELETE FROM task_execution_leases WHERE task_id = ?1 AND lease_token = ?2`)
+    .bind(taskId, leaseToken)
+    .run();
+}
+
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
@@ -76,6 +166,13 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       env,
     );
     if (controlResponse) return controlResponse;
+
+    const assistantResponse = await handleTelegramAssistantWebhook(
+      request.clone() as unknown as Request,
+      env,
+    );
+    if (assistantResponse) return assistantResponse;
+
     return handleTelegramWebhook(request, env);
   }
 
@@ -91,6 +188,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       defaultLanguage: "zh",
       delivery: isGmailConfigured(env) && env.KINDLE_EMAIL ? "gmail" : "not_configured",
       telegram: isTelegramConfigured(env) ? "configured" : "not_configured",
+      assistant: env.AI ? "queued_workers_ai" : "not_configured",
       vision: env.AI ? "workers_ai" : "not_configured",
     });
   }
@@ -124,11 +222,75 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       );
     }
 
-    const id = crypto.randomUUID();
-    await repo.create(id, bookRequest);
-    await guard.increment("tasks_created");
-    await env.TASK_QUEUE.send({ kind: "book", taskId: id });
+    const idempotency = readIdempotencyKey(request);
+    if (idempotency.error) {
+      return json({ error: "invalid_idempotency_key", message: idempotency.error }, { status: 400 });
+    }
 
+    if (idempotency.key) {
+      const existingId = await mappedTaskId(env, idempotency.key);
+      if (existingId) {
+        const existingTask = await repo.get(existingId);
+        if (existingTask) {
+          return json(
+            { id: existingTask.id, status: existingTask.status, idempotentReplay: true },
+            { status: 202 },
+          );
+        }
+        await releaseIdempotencyKey(env, idempotency.key, existingId);
+      }
+    }
+
+    const id = crypto.randomUUID();
+    if (idempotency.key) {
+      const reserved = await reserveIdempotencyKey(env, idempotency.key, id);
+      if (!reserved) {
+        const winnerId = await mappedTaskId(env, idempotency.key);
+        if (winnerId) {
+          const winner = await repo.get(winnerId);
+          if (winner) {
+            return json(
+              { id: winner.id, status: winner.status, idempotentReplay: true },
+              { status: 202 },
+            );
+          }
+        }
+        return json(
+          {
+            error: "idempotency_request_in_progress",
+            message: "Another request with the same Idempotency-Key is still being committed. Retry shortly.",
+          },
+          { status: 409, headers: { "retry-after": "1" } },
+        );
+      }
+    }
+
+    try {
+      await repo.create(id, bookRequest);
+    } catch (error) {
+      if (idempotency.key) await releaseIdempotencyKey(env, idempotency.key, id);
+      throw error;
+    }
+
+    try {
+      await env.TASK_QUEUE.send({ kind: "book", taskId: id });
+    } catch (error) {
+      try {
+        await cleanupFailedHttpTask(env, id, idempotency.key);
+      } catch (cleanupError) {
+        console.error("Could not clean up failed HTTP task enqueue", id, cleanupError);
+      }
+      console.error("HTTP task queue enqueue failed", id, error);
+      return json(
+        {
+          error: "queue_unavailable",
+          message: "The task was not accepted because Queue enqueue failed. It is safe to retry.",
+        },
+        { status: 503, headers: { "retry-after": "2" } },
+      );
+    }
+
+    await guard.increment("tasks_created");
     return json({ id, status: "queued" }, { status: 202 });
   }
 
@@ -187,6 +349,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const selected = task.candidates.find((candidate) => candidate.id === candidateId);
     if (!selected) return json({ error: "candidate_not_found" }, { status: 404 });
 
+    const originalCandidates = task.candidates;
     await repo.update(task.id, {
       status: "queued",
       candidates: null,
@@ -197,7 +360,22 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     if (String(latest?.status) === "cancelled") {
       return json({ error: "task_cancelled", id: task.id }, { status: 409 });
     }
-    await env.TASK_QUEUE.send({ kind: "book", taskId: task.id });
+
+    try {
+      await env.TASK_QUEUE.send({ kind: "book", taskId: task.id });
+    } catch (error) {
+      console.error("Selection queue enqueue failed", task.id, error);
+      await repo.update(task.id, {
+        status: "needs_selection",
+        candidates: originalCandidates,
+        selectedCandidate: null,
+        errorMessage: "Selection was saved but Queue enqueue failed; please choose again.",
+      });
+      return json(
+        { error: "queue_unavailable", id: task.id, status: "needs_selection" },
+        { status: 503, headers: { "retry-after": "2" } },
+      );
+    }
 
     return json({ id: task.id, status: "queued", selectedCandidate: selected }, { status: 202 });
   }
@@ -211,7 +389,7 @@ function sources(env: Env) {
     new GoogleBooksFreeSource(),
     new InternetArchivePublicSource(),
     ZLibrarySource.create(env),
-  ];
+  ].map(withRelevanceGate);
 }
 
 export default {
@@ -223,9 +401,21 @@ export default {
     const delivery = isGmailConfigured(env) ? new GmailDelivery(env) : undefined;
 
     for (const message of batch.messages) {
+      if (message.body.kind === "telegram_assistant_text") {
+        try {
+          await processTelegramAssistantMessage(message.body, env);
+          message.ack();
+        } catch (error) {
+          console.error("Telegram assistant Queue job failed", message.body.updateId, error);
+          message.retry();
+        }
+        continue;
+      }
+
       if (message.body.kind === "telegram_image") {
         try {
-          await processTelegramImageMessage(message.body, env);
+          const imageEnv: Env = { ...env, AI: createReceiverSafeAi(env.AI) };
+          await processTelegramImageMessage(message.body, imageEnv);
         } catch (error) {
           console.error("Telegram image queue job failed", message.body.sourceMessageId, error);
         }
@@ -233,19 +423,23 @@ export default {
         continue;
       }
 
-      if (message.body.kind === "telegram_text_semantic") {
-        try {
-          await processTelegramSemanticText(message.body, env);
-        } catch (error) {
-          console.error("Telegram semantic text queue job failed", message.body.sourceMessageId, error);
-        }
+      const taskId = message.body.taskId;
+      const leaseToken = crypto.randomUUID();
+      let acquired = false;
+      try {
+        acquired = await tryAcquireTaskExecutionLease(env, taskId, leaseToken);
+      } catch (leaseError) {
+        console.error("Could not acquire task execution lease", taskId, leaseError);
+        message.retry();
+        continue;
+      }
+
+      if (!acquired) {
         message.ack();
         continue;
       }
 
-      const taskId = message.body.taskId;
       let processingError: unknown;
-
       try {
         await processTask(taskId, {
           env,
@@ -255,6 +449,12 @@ export default {
       } catch (error) {
         processingError = error;
         console.error("Queue task failed", taskId, error);
+      } finally {
+        try {
+          await releaseTaskExecutionLease(env, taskId, leaseToken);
+        } catch (releaseError) {
+          console.error("Could not release task execution lease", taskId, releaseError);
+        }
       }
 
       try {

@@ -96,15 +96,19 @@ export interface TelegramImageQueueMessage {
   mimeType?: string;
 }
 
-export interface TelegramSemanticTextQueueMessage {
-  kind: "telegram_text_semantic";
+export interface TelegramAssistantTextQueueMessage {
+  kind: "telegram_assistant_text";
+  updateId: number;
   chatId: string;
   userId: string;
   sourceMessageId: number;
   text: string;
 }
 
-export type TaskQueueMessage = BookTaskQueueMessage | TelegramImageQueueMessage | TelegramSemanticTextQueueMessage;
+export type TaskQueueMessage =
+  | BookTaskQueueMessage
+  | TelegramImageQueueMessage
+  | TelegramAssistantTextQueueMessage;
 
 export interface SourceAdapter {
   name: string;
@@ -121,6 +125,12 @@ export interface SourceAdapter {
 
 export interface DeliveryAdapter {
   name: string;
+  /**
+   * Recover a receipt that was durably accepted by the provider but not yet
+   * persisted on the task because the worker crashed between side effect and
+   * task-state update. A null result means the outcome is not known accepted.
+   */
+  recover?(task: TaskRecord): Promise<DeliveryReceipt | null>;
   deliver(input: {
     task: TaskRecord;
     object: R2ObjectBody;
@@ -139,7 +149,7 @@ export interface Env {
   TEMP_OBJECT_TTL_HOURS?: string;
   MAX_CLOUD_FILE_BYTES?: string;
   MAX_TELEGRAM_IMAGE_BYTES?: string;
-  SEMANTIC_TEXT_MODEL?: string;
+  ASSISTANT_MODEL?: string;
   GMAIL_CLIENT_ID?: string;
   GMAIL_CLIENT_SECRET?: string;
   GMAIL_REFRESH_TOKEN?: string;
