@@ -3,8 +3,8 @@ Book to Kindle staging acceptance handoff
 Current stabilization branch:
 stabilize/book-to-kindle-v1
 
-Current HEAD:
-ff2496f48f6539bda9fb0d053f970fdc4cef1354
+Queue replay probe baseline commit:
+ff2496f48f6539bda9fb0d053f970fdc4cef1354 or later
 
 Production protection:
 - Do not modify main.
@@ -37,7 +37,7 @@ Current accepted status:
 - OVERALL: PARTIAL.
 
 Temporary staging Queue replay probe:
-- Commit ff2496f48f6539bda9fb0d053f970fdc4cef1354 adds POST /api/v1/_staging/queue/replay.
+- Commit ff2496f48f6539bda9fb0d053f970fdc4cef1354 introduced POST /api/v1/_staging/queue/replay; use that commit or any later branch HEAD containing it.
 - The endpoint is protected by the normal API_TOKEN authorization and additionally hard-disabled unless APP_ENV == "staging".
 - It only accepts an existing UUID taskId and enqueues { kind: "book", taskId } through the real TASK_QUEUE binding.
 - Purpose: complete real active-lease replay blocking and expired-lease recovery without requiring a separate Cloudflare Queues Write API token.
@@ -45,7 +45,7 @@ Temporary staging Queue replay probe:
 - After live Queue acceptance evidence is collected, remove the temporary probe endpoint, rerun CI, and redeploy staging from the cleaned branch.
 
 Queue live acceptance procedure:
-1. Pull ff2496f48f6539bda9fb0d053f970fdc4cef1354 or later.
+1. Pull the latest stabilize/book-to-kindle-v1 HEAD and verify it contains commit ff2496f48f6539bda9fb0d053f970fdc4cef1354.
 2. Run typecheck/tests; stop on failure.
 3. Deploy only with wrangler.staging.toml and confirm /health environment=staging.
 4. Create a dedicated staging probe task in D1 with a valid UUID and status queued.
