@@ -11,6 +11,20 @@ interface GmailSendResponse {
   threadId?: string;
 }
 
+interface DeliveryFenceRow {
+  state: "started" | "accepted" | "unknown";
+  updated_at: string;
+  provider_message_id?: string | null;
+  provider_thread_id?: string | null;
+}
+
+export class DeliveryFenceBlockedError extends Error {
+  constructor(taskId: string, state: string) {
+    super(`Delivery fence for task ${taskId} is already ${state}; automatic resend is blocked.`);
+    this.name = "DeliveryFenceBlockedError";
+  }
+}
+
 function encodeHeader(value: string): string {
   const bytes = new TextEncoder().encode(value);
   let binary = "";
@@ -112,6 +126,71 @@ async function getAccessToken(env: Env): Promise<string> {
   return data.access_token;
 }
 
+async function claimDeliveryFence(
+  env: Env,
+  taskId: string,
+  attemptId: string,
+): Promise<DeliveryReceipt | null> {
+  const now = new Date().toISOString();
+  const inserted = await env.DB
+    .prepare(
+      `INSERT INTO delivery_fences
+         (task_id, attempt_id, state, started_at, updated_at)
+       VALUES (?1, ?2, 'started', ?3, ?3)
+       ON CONFLICT(task_id) DO NOTHING`,
+    )
+    .bind(taskId, attemptId, now)
+    .run();
+
+  if (Number(inserted.meta.changes ?? 0) > 0) return null;
+
+  const existing = await env.DB
+    .prepare(
+      `SELECT state, updated_at, provider_message_id, provider_thread_id
+       FROM delivery_fences WHERE task_id = ?1`,
+    )
+    .bind(taskId)
+    .first<DeliveryFenceRow>();
+
+  if (existing?.state === "accepted") {
+    return {
+      provider: "gmail",
+      acceptedAt: existing.updated_at,
+      messageId: existing.provider_message_id || undefined,
+      threadId: existing.provider_thread_id || undefined,
+    };
+  }
+
+  throw new DeliveryFenceBlockedError(taskId, existing?.state ?? "unknown");
+}
+
+async function updateDeliveryFence(
+  env: Env,
+  taskId: string,
+  attemptId: string,
+  state: "accepted" | "unknown",
+  receipt?: GmailSendResponse,
+): Promise<void> {
+  await env.DB
+    .prepare(
+      `UPDATE delivery_fences
+       SET state = ?3,
+           updated_at = ?4,
+           provider_message_id = ?5,
+           provider_thread_id = ?6
+       WHERE task_id = ?1 AND attempt_id = ?2`,
+    )
+    .bind(
+      taskId,
+      attemptId,
+      state,
+      new Date().toISOString(),
+      receipt?.id ?? null,
+      receipt?.threadId ?? null,
+    )
+    .run();
+}
+
 export function isGmailConfigured(env: Env): boolean {
   return Boolean(
     env.GMAIL_CLIENT_ID &&
@@ -135,6 +214,8 @@ export class GmailDelivery implements DeliveryAdapter {
     const selected = input.task.selectedCandidate;
     if (!selected) throw new Error("Task has no selected candidate to deliver.");
 
+    // Refresh OAuth and prepare the MIME stream before claiming the permanent
+    // side-effect fence. Failures here are known to happen before Gmail send.
     const token = await getAccessToken(this.env);
     const contentType = input.object.httpMetadata?.contentType || "application/octet-stream";
     const message = mimeStream({
@@ -146,35 +227,52 @@ export class GmailDelivery implements DeliveryAdapter {
       contentType,
     });
 
-    const response = await fetch(
-      "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=media",
-      {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${token}`,
-          "content-type": "message/rfc822",
-        },
-        body: message,
-      },
-    );
+    const attemptId = crypto.randomUUID();
+    const previousReceipt = await claimDeliveryFence(this.env, input.task.id, attemptId);
+    if (previousReceipt) return previousReceipt;
 
-    if (!response.ok) {
-      const detail = (await response.text()).slice(0, 1000);
-      throw new Error(`Gmail delivery failed with HTTP ${response.status}: ${detail}`);
-    }
-
-    let data: GmailSendResponse = {};
     try {
-      data = (await response.json()) as GmailSendResponse;
-    } catch {
-      // A successful Gmail HTTP response is enough to treat the message as accepted.
-    }
+      const response = await fetch(
+        "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=media",
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "message/rfc822",
+          },
+          body: message,
+        },
+      );
 
-    return {
-      provider: this.name,
-      acceptedAt: new Date().toISOString(),
-      messageId: data.id,
-      threadId: data.threadId,
-    };
+      if (!response.ok) {
+        const detail = (await response.text()).slice(0, 1000);
+        await updateDeliveryFence(this.env, input.task.id, attemptId, "unknown");
+        throw new Error(`Gmail delivery failed with HTTP ${response.status}: ${detail}`);
+      }
+
+      let data: GmailSendResponse = {};
+      try {
+        data = (await response.json()) as GmailSendResponse;
+      } catch {
+        // A successful Gmail HTTP response is enough to treat the message as accepted.
+      }
+
+      await updateDeliveryFence(this.env, input.task.id, attemptId, "accepted", data);
+      return {
+        provider: this.name,
+        acceptedAt: new Date().toISOString(),
+        messageId: data.id,
+        threadId: data.threadId,
+      };
+    } catch (error) {
+      if (!(error instanceof DeliveryFenceBlockedError)) {
+        try {
+          await updateDeliveryFence(this.env, input.task.id, attemptId, "unknown");
+        } catch (fenceError) {
+          console.error("Could not persist delivery fence unknown state", input.task.id, fenceError);
+        }
+      }
+      throw error;
+    }
   }
 }
