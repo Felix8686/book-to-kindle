@@ -13,6 +13,15 @@ function normalizeText(value?: string): string {
     .trim();
 }
 
+function tokenizeAuthor(value?: string): string[] {
+  return (value ?? "")
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .split(/[^\p{L}\p{N}]+/gu)
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
 function identifierSet(identifiers?: BookIdentifiers): Set<string> {
   return new Set(
     [...(identifiers?.isbn10 ?? []), ...(identifiers?.isbn13 ?? [])]
@@ -55,7 +64,21 @@ function authorCompatible(candidateAuthor: string | undefined, requestedAuthor: 
   const actual = normalizeText(candidateAuthor);
   const expected = normalizeText(requestedAuthor);
   if (!actual || !expected) return false;
-  return actual === expected || actual.includes(expected) || expected.includes(actual);
+  if (actual === expected || actual.includes(expected) || expected.includes(actual)) return true;
+
+  // Western bibliographic sources often emit names as "Family, Given" while
+  // users naturally type "Given Family". Compare multi-token names without
+  // depending on token order, while preserving the stricter path for single-
+  // token names such as Chinese author names.
+  const actualTokens = tokenizeAuthor(candidateAuthor);
+  const expectedTokens = tokenizeAuthor(requestedAuthor);
+  if (actualTokens.length < 2 || expectedTokens.length < 2) return false;
+
+  const actualSet = new Set(actualTokens);
+  const expectedSet = new Set(expectedTokens);
+  const expectedContained = [...expectedSet].every((token) => actualSet.has(token));
+  const actualContained = [...actualSet].every((token) => expectedSet.has(token));
+  return expectedContained || actualContained;
 }
 
 export function isRelevantCandidate(
