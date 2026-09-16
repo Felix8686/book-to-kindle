@@ -198,10 +198,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   const repo = new TaskRepository(env.DB);
   const guard = new UsageGuard(env.DB);
 
-  // Temporary acceptance-test hook. It is API-token protected and hard-disabled
-  // outside the isolated staging environment. This lets staging replay an
-  // existing book Queue message without requiring a separate Cloudflare Queues
-  // write token, so the real consumer lease behavior can be fault-injected.
+  // TEMPORARY STAGING ACCEPTANCE PROBE. Remove after Queue lease live testing.
+  // API_TOKEN protected + unavailable unless APP_ENV is exactly "staging".
   if (request.method === "POST" && url.pathname === "/api/v1/_staging/queue/replay") {
     if (env.APP_ENV !== "staging") {
       return json({ error: "not_found" }, { status: 404 });
