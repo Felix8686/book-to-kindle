@@ -18,6 +18,8 @@ import {
 import { createReceiverSafeAi } from "./workers-ai";
 import { processTask } from "./workflow";
 
+const TASK_EXECUTION_LEASE_MS = 15 * 60 * 1000;
+
 function json(data: unknown, init: ResponseInit = {}): Response {
   const headers = new Headers(init.headers);
   headers.set("content-type", "application/json; charset=utf-8");
@@ -109,6 +111,40 @@ async function cleanupFailedHttpTask(env: Env, taskId: string, idempotencyKey?: 
     );
   }
   await env.DB.batch(statements);
+}
+
+async function tryAcquireTaskExecutionLease(
+  env: Env,
+  taskId: string,
+  leaseToken: string,
+): Promise<boolean> {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const leaseUntil = new Date(now.getTime() + TASK_EXECUTION_LEASE_MS).toISOString();
+  const result = await env.DB
+    .prepare(
+      `INSERT INTO task_execution_leases (task_id, lease_token, lease_until, updated_at)
+       VALUES (?1, ?2, ?3, ?4)
+       ON CONFLICT(task_id) DO UPDATE SET
+         lease_token = excluded.lease_token,
+         lease_until = excluded.lease_until,
+         updated_at = excluded.updated_at
+       WHERE task_execution_leases.lease_until <= ?4`,
+    )
+    .bind(taskId, leaseToken, leaseUntil, nowIso)
+    .run();
+  return Number(result.meta.changes ?? 0) > 0;
+}
+
+async function releaseTaskExecutionLease(
+  env: Env,
+  taskId: string,
+  leaseToken: string,
+): Promise<void> {
+  await env.DB
+    .prepare(`DELETE FROM task_execution_leases WHERE task_id = ?1 AND lease_token = ?2`)
+    .bind(taskId, leaseToken)
+    .run();
 }
 
 async function handleRequest(request: Request, env: Env): Promise<Response> {
@@ -365,8 +401,25 @@ export default {
       }
 
       const taskId = message.body.taskId;
-      let processingError: unknown;
+      const leaseToken = crypto.randomUUID();
+      let acquired = false;
+      try {
+        acquired = await tryAcquireTaskExecutionLease(env, taskId, leaseToken);
+      } catch (leaseError) {
+        console.error("Could not acquire task execution lease", taskId, leaseError);
+        message.retry();
+        continue;
+      }
 
+      if (!acquired) {
+        // A concurrent delivery of the same Queue task already owns the lease.
+        // Acknowledge this duplicate message; the active owner or its own retry
+        // remains responsible for completion.
+        message.ack();
+        continue;
+      }
+
+      let processingError: unknown;
       try {
         await processTask(taskId, {
           env,
@@ -376,6 +429,12 @@ export default {
       } catch (error) {
         processingError = error;
         console.error("Queue task failed", taskId, error);
+      } finally {
+        try {
+          await releaseTaskExecutionLease(env, taskId, leaseToken);
+        } catch (releaseError) {
+          console.error("Could not release task execution lease", taskId, releaseError);
+        }
       }
 
       try {
