@@ -4,11 +4,14 @@ import type {
   Env,
   TaskRecord,
   TelegramImageQueueMessage,
-  TelegramSemanticTextQueueMessage,
 } from "./domain";
 import { TaskRepository } from "./repository";
-import { isSemanticParsingConfigured, parseTextSemantics } from "./semantic";
-import { queryAuthorWorks, type AuthorWork } from "./catalog";
+import {
+  decideAssistantAction,
+  TelegramConversationRepository,
+  type AssistantDecision,
+} from "./assistant";
+import { runWorkersAi } from "./workers-ai";
 
 const VISION_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct" as const;
 const DEFAULT_MAX_TELEGRAM_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -442,36 +445,22 @@ export function parseTelegramBookRequest(text: string): BookRequest | null {
   return { query: cleaned, author, language, preferredFormat };
 }
 
-// Structured request markers are explicit, unambiguous syntax (quoted titles,
-// labeled author fields, declared format/language, the /send command) — they
-// say WHAT the fields are, not WHAT the user wants. Intent for text without
-// such markers is semantic and belongs to the AI layer (ARCHITECTURE.md §3).
-export function hasStructuredRequestMarkers(text: string): boolean {
-  if (/^\/(?:send|book)(?:@\w+)?\s+/i.test(text)) return true;
-  if (/《[^》]{1,300}》/.test(text)) return true;
-  if (/["“”'][^"“”']{1,300}["“”']/.test(text)) return true;
-  if (/(?:作者|author)\s*[：:]/i.test(text)) return true;
-  if (/\b(?:epub|pdf)\b/i.test(text)) return true;
-  if (explicitLanguage(text)) return true;
-  return false;
-}
-
 function helpText(): string {
   return [
     "Book to Kindle 已连接。",
     "",
-    "可以直接发送书名，也可以发送清晰的书籍封面/截图。",
+    "现在可以直接像聊天一样使用：问作者、作品、系列、推荐，也可以让我找书并发送到 Kindle。",
     "例如：",
+    "倪匡有哪些值得看？",
+    "卫斯理系列从哪本开始？",
     "把《Pride and Prejudice》发到 Kindle",
-    "Pride and Prejudice",
-    "《The Little Prince》 PDF",
-    "或者直接发一张书封面图片。",
+    "第二本发到 Kindle",
+    "或者直接发一张清晰的书封面/书单截图。",
     "",
-    "图片说明文字可写：PDF、中文、英文等偏好。",
-    "若图片里有多本书或识别不够确定，机器人会让你点选。",
+    "含义不明确时，助手会先回答或追问，不会把所有文字都当成书名创建任务。",
     "",
     "命令：",
-    "/send <书名>  创建任务",
+    "/send <书名>  明确创建发送任务",
     "/status  查看最近任务",
     "/whoami  查看你的 Telegram user ID",
     "/help  查看帮助",
@@ -569,8 +558,6 @@ async function createTelegramBookTask(input: {
   try {
     await input.env.TASK_QUEUE.send({ kind: "book", taskId });
   } catch (error) {
-    // No Queue side effect was confirmed, so remove the incomplete task and
-    // let Telegram retry this update instead of leaving it stuck in queued.
     await input.env.DB.batch([
       input.env.DB.prepare(`DELETE FROM telegram_task_links WHERE task_id = ?1`).bind(taskId),
       input.env.DB.prepare(`DELETE FROM tasks WHERE id = ?1`).bind(taskId),
@@ -584,28 +571,32 @@ async function handleStatusCommand(
   env: Env,
   message: TelegramMessage,
   userId: string,
-): Promise<void> {
+): Promise<string> {
   const links = new TelegramTaskLinkRepository(env.DB);
   const repo = new TaskRepository(env.DB);
   const explicitTaskId = message.text?.trim().split(/\s+/)[1];
   const link = explicitTaskId ? await links.get(explicitTaskId) : await links.latestForUser(userId);
 
   if (!link || link.userId !== userId) {
-    await sendTelegramMessage(env, String(message.chat.id), "没有找到可查看的任务。", {
+    const text = "没有找到可查看的任务。";
+    await sendTelegramMessage(env, String(message.chat.id), text, {
       reply_to_message_id: message.message_id,
     });
-    return;
+    return text;
   }
 
   const task = await repo.get(link.taskId);
   if (!task) {
-    await sendTelegramMessage(env, String(message.chat.id), "任务记录不存在。", {
+    const text = "任务记录不存在。";
+    await sendTelegramMessage(env, String(message.chat.id), text, {
       reply_to_message_id: message.message_id,
     });
-    return;
+    return text;
   }
 
+  const text = taskStatusText(task);
   await sendTaskStatus(env, String(message.chat.id), task);
+  return text;
 }
 
 function supportedDocumentImage(document?: TelegramDocument): boolean {
@@ -636,6 +627,102 @@ function chooseTelegramImage(message: TelegramMessage): {
   }
 
   return null;
+}
+
+function isExplicitBookCommand(text: string): boolean {
+  return /^\/(?:send|book)(?:@\w+)?\s+/i.test(text.trim());
+}
+
+function looksLikeExplicitBookAction(text: string): boolean {
+  const value = text.trim();
+  if (isExplicitBookCommand(value)) return true;
+  if (/(?:发|发送|推送|送|传|放)(?:给|到|至)?\s*(?:我的)?\s*kindle/iu.test(value)) return true;
+  if (/(?:帮我|给我|替我).{0,8}(?:找|搜|下载|获取).{0,80}(?:《[^》]+》|这本书|一本书)/iu.test(value)) return true;
+  if (/\b(?:send|deliver)\b.{0,80}\b(?:kindle|book)\b/i.test(value)) return true;
+  return false;
+}
+
+async function rememberAssistantExchange(
+  conversation: TelegramConversationRepository,
+  chatId: string,
+  userId: string,
+  userText: string,
+  assistantText: string,
+): Promise<void> {
+  await conversation.append(chatId, userId, "user", userText);
+  await conversation.append(chatId, userId, "assistant", assistantText);
+}
+
+async function handleAssistantText(
+  env: Env,
+  message: TelegramMessage,
+  userId: string,
+  text: string,
+): Promise<void> {
+  const chatId = String(message.chat.id);
+  const conversation = new TelegramConversationRepository(env.DB);
+  const history = await conversation.history(chatId, userId);
+  let decision: AssistantDecision;
+
+  try {
+    decision = await decideAssistantAction(env, text, history);
+  } catch (error) {
+    console.error("Telegram assistant routing failed", message.message_id, error);
+
+    if (looksLikeExplicitBookAction(text)) {
+      const fallbackRequest = parseTelegramBookRequest(text);
+      if (fallbackRequest) {
+        await createTelegramBookTask({
+          env,
+          chatId,
+          userId,
+          sourceMessageId: message.message_id,
+          request: fallbackRequest,
+        });
+        const acknowledgement = `已确认《${fallbackRequest.query}》，开始查找并发送到 Kindle。`;
+        await sendTelegramMessage(env, chatId, acknowledgement, {
+          reply_to_message_id: message.message_id,
+        });
+        await rememberAssistantExchange(conversation, chatId, userId, text, acknowledgement);
+        return;
+      }
+    }
+
+    const fallback =
+      "我现在没能可靠理解这句话，所以没有创建 Kindle 任务。你可以继续说明想了解什么，或者明确说“把《书名》发到 Kindle”。";
+    await sendTelegramMessage(env, chatId, fallback, {
+      reply_to_message_id: message.message_id,
+    });
+    await rememberAssistantExchange(conversation, chatId, userId, text, fallback);
+    return;
+  }
+
+  if (decision.kind === "status") {
+    const statusText = await handleStatusCommand(env, message, userId);
+    await rememberAssistantExchange(conversation, chatId, userId, text, statusText);
+    return;
+  }
+
+  if (decision.kind === "book") {
+    await createTelegramBookTask({
+      env,
+      chatId,
+      userId,
+      sourceMessageId: message.message_id,
+      request: decision.request,
+    });
+    const acknowledgement = `已确认《${decision.request.query}》，开始查找并发送到 Kindle。`;
+    await sendTelegramMessage(env, chatId, acknowledgement, {
+      reply_to_message_id: message.message_id,
+    });
+    await rememberAssistantExchange(conversation, chatId, userId, text, acknowledgement);
+    return;
+  }
+
+  await sendTelegramMessage(env, chatId, decision.text, {
+    reply_to_message_id: message.message_id,
+  });
+  await rememberAssistantExchange(conversation, chatId, userId, text, decision.text);
 }
 
 async function handleMessage(env: Env, message: TelegramMessage): Promise<void> {
@@ -679,6 +766,31 @@ async function handleMessage(env: Env, message: TelegramMessage): Promise<void> 
 
   if (text && /^\/status(?:@\w+)?(?:\s|$)/i.test(text)) {
     await handleStatusCommand(env, message, userId);
+    return;
+  }
+
+  if (text && isExplicitBookCommand(text)) {
+    const bookRequest = parseTelegramBookRequest(text);
+    if (!bookRequest) {
+      await sendTelegramMessage(env, chatId, helpText(), {
+        reply_to_message_id: message.message_id,
+      });
+      return;
+    }
+
+    await createTelegramBookTask({
+      env,
+      chatId,
+      userId,
+      sourceMessageId: message.message_id,
+      request: bookRequest,
+    });
+    const acknowledgement = `已确认《${bookRequest.query}》，开始查找并发送到 Kindle。`;
+    await sendTelegramMessage(env, chatId, acknowledgement, {
+      reply_to_message_id: message.message_id,
+    });
+    const conversation = new TelegramConversationRepository(env.DB);
+    await rememberAssistantExchange(conversation, chatId, userId, text, acknowledgement);
     return;
   }
 
@@ -726,51 +838,7 @@ async function handleMessage(env: Env, message: TelegramMessage): Promise<void> 
     return;
   }
 
-  const bookRequest = parseTelegramBookRequest(text);
-  // Deterministic first: explicit structured input is parsed by code and never
-  // costs a model call. Free-form text without structural markers is a
-  // semantic question (title request vs question vs catalog query) and is
-  // routed to the AI semantic layer in the Queue when the AI binding exists.
-  if (!isSemanticParsingConfigured(env) || (bookRequest && hasStructuredRequestMarkers(text))) {
-    if (!bookRequest) {
-      await sendTelegramMessage(env, chatId, helpText(), {
-        reply_to_message_id: message.message_id,
-      });
-      return;
-    }
-
-    await createTelegramBookTask({
-      env,
-      chatId,
-      userId,
-      sourceMessageId: message.message_id,
-      request: bookRequest,
-    });
-
-    await sendTelegramMessage(
-      env,
-      chatId,
-      `已收到《${bookRequest.query}》，开始查找并发送到 Kindle。`,
-      { reply_to_message_id: message.message_id },
-    );
-    return;
-  }
-
-  try {
-    await env.TASK_QUEUE.send({
-      kind: "telegram_text_semantic",
-      chatId,
-      userId,
-      sourceMessageId: message.message_id,
-      text: text.slice(0, 500),
-    });
-  } catch (error) {
-    throw new TelegramQueueEnqueueError("Could not enqueue Telegram semantic text job.", { cause: error });
-  }
-
-  await sendTelegramMessage(env, chatId, "正在理解你的请求……", {
-    reply_to_message_id: message.message_id,
-  });
+  await handleAssistantText(env, message, userId, text);
 }
 
 async function handleSourceCandidateCallback(
@@ -982,7 +1050,7 @@ function normalizeRecognition(value: unknown): RecognizedBook[] {
   return output.sort((a, b) => b.confidence - a.confidence).slice(0, 5);
 }
 
-async function recognizeBooksFromImage(
+export async function recognizeBooksFromImage(
   env: Env,
   imageBytes: Uint8Array,
   mimeType: string,
@@ -997,16 +1065,7 @@ async function recognizeBooksFromImage(
     caption ? `The user added this caption: ${caption}` : "The user added no caption.",
   ].join("\n");
 
-  // Cloudflare's runtime supports JSON Mode for this vision model, while the
-  // generated Workers TypeScript declaration currently lags that documented field.
-  // `run` must keep its `this` binding (see semantic.ts): a detached reference
-  // fails inside the Ai binding with "Cannot set properties of undefined".
-  const runVision = env.AI.run.bind(env.AI) as unknown as (
-    model: string,
-    inputs: Record<string, unknown>,
-  ) => Promise<unknown>;
-
-  const raw = await runVision(VISION_MODEL, {
+  const raw = await runWorkersAi(env.AI, VISION_MODEL, {
     messages: [
       {
         role: "system",
@@ -1169,95 +1228,6 @@ export async function processTelegramImageMessage(
       { reply_to_message_id: job.sourceMessageId },
     );
   }
-}
-
-export async function processTelegramSemanticText(
-  job: TelegramSemanticTextQueueMessage,
-  env: Env,
-): Promise<void> {
-  if (!env.TELEGRAM_BOT_TOKEN) throw new Error("Telegram bot is not configured.");
-  if (!isAllowedUser(env, job.userId)) return;
-
-  try {
-    const parsed = await parseTextSemantics(env, job.text);
-
-    if (parsed.intent === "author_works" && parsed.author) {
-      await sendAuthorWorksReply(env, job.chatId, job.sourceMessageId, parsed.author);
-      return;
-    }
-
-    if ((parsed.intent === "find_book" || parsed.intent === "send_book") && parsed.title) {
-      const request: BookRequest = {
-        query: parsed.title,
-        ...(parsed.author ? { author: parsed.author } : {}),
-        ...(parsed.language ? { language: parsed.language } : {}),
-        preferredFormat: parsed.preferredFormat ?? explicitFormat(job.text),
-      };
-      await createTelegramBookTask({
-        env,
-        chatId: job.chatId,
-        userId: job.userId,
-        sourceMessageId: job.sourceMessageId,
-        request,
-      });
-      await sendTelegramMessage(
-        env,
-        job.chatId,
-        `已理解你要找《${request.query}》，开始查找并发送到 Kindle。`,
-        { reply_to_message_id: job.sourceMessageId },
-      );
-      return;
-    }
-
-    await sendTelegramMessage(
-      env,
-      job.chatId,
-      "我没太理解你的意思。可以发送书名（如《西游记》），或询问某位作者写过哪些作品，也可以直接发送书籍封面图片。",
-      { reply_to_message_id: job.sourceMessageId },
-    );
-  } catch (error) {
-    console.error("Telegram semantic text job failed", job.sourceMessageId, error);
-    await sendTelegramMessage(
-      env,
-      job.chatId,
-      "语义理解暂时失败。请稍后重发消息，或直接发送书名。",
-      { reply_to_message_id: job.sourceMessageId },
-    );
-  }
-}
-
-async function sendAuthorWorksReply(
-  env: Env,
-  chatId: string,
-  sourceMessageId: number,
-  author: string,
-): Promise<void> {
-  let works: AuthorWork[] = [];
-  try {
-    works = await queryAuthorWorks(author);
-  } catch (error) {
-    console.warn("Author works query failed", author, error);
-  }
-
-  if (works.length === 0) {
-    await sendTelegramMessage(
-      env,
-      chatId,
-      `暂时没能确认「${author}」的作品记录。可以直接发送具体书名来创建发送任务。`,
-      { reply_to_message_id: sourceMessageId },
-    );
-    return;
-  }
-
-  const lines = works.map(
-    (work, index) => `${index + 1}. 《${work.title}》${work.firstPublishYear ? `（${work.firstPublishYear}）` : ""}`,
-  );
-  await sendTelegramMessage(
-    env,
-    chatId,
-    [`Open Library 收录的「${author}」作品（按版本数量排序）：`, ...lines].join("\n"),
-    { reply_to_message_id: sourceMessageId },
-  );
 }
 
 export function isTelegramConfigured(env: Env): boolean {

@@ -153,6 +153,10 @@ async function claimTelegramUpdate(env: Env, updateId: number): Promise<boolean>
   return Number(result.meta.changes ?? 0) > 0;
 }
 
+async function releaseTelegramUpdate(env: Env, updateId: number): Promise<void> {
+  await env.DB.prepare(`DELETE FROM telegram_updates WHERE update_id = ?1`).bind(updateId).run();
+}
+
 function isCancelCommand(text: string): boolean {
   return (
     /^\/cancel(?:@\w+)?(?:\s|$)/i.test(text) ||
@@ -318,52 +322,69 @@ export async function handleTelegramControlWebhook(
   if (!isHelp && !isStatus && !isCancel) return null;
   if (!isAllowedUser(env, userId)) return null;
 
-  if (isStatus) {
-    const requestedTaskId = text.split(/\s+/)[1];
-    const cancelled = await linkedCancelledTaskForStatus(env, userId, requestedTaskId);
-    if (!cancelled) return null;
+  let claimed = false;
+  try {
+    if (isStatus) {
+      const requestedTaskId = text.split(/\s+/)[1];
+      const cancelled = await linkedCancelledTaskForStatus(env, userId, requestedTaskId);
+      if (!cancelled) return null;
+
+      if (!(await claimTelegramUpdate(env, update.update_id))) return new Response("ok");
+      claimed = true;
+      await sendTelegramMessage(
+        env,
+        chatId,
+        `《${cancelled.title}》已取消。\n任务 ID：${cancelled.taskId}`,
+        message.message_id,
+      );
+      return new Response("ok");
+    }
 
     if (!(await claimTelegramUpdate(env, update.update_id))) return new Response("ok");
-    await sendTelegramMessage(
-      env,
-      chatId,
-      `《${cancelled.title}》已取消。\n任务 ID：${cancelled.taskId}`,
-      message.message_id,
-    );
+    claimed = true;
+
+    if (isHelp) {
+      await sendTelegramMessage(env, chatId, helpText(), message.message_id);
+      return new Response("ok");
+    }
+
+    const targeted = hasCancelArgument(text);
+    const requestedTaskId = explicitTaskId(text);
+    if (targeted && !requestedTaskId) {
+      await sendTelegramMessage(
+        env,
+        chatId,
+        "任务 ID 格式不正确。请使用 `/cancel <完整 task-id>`，或直接发送 `/cancel` 取消最近仍在处理的任务。",
+        message.message_id,
+      );
+      return new Response("ok");
+    }
+
+    const taskId = await linkedTaskForUser(env, userId, requestedTaskId);
+    if (!taskId) {
+      await sendTelegramMessage(
+        env,
+        chatId,
+        requestedTaskId ? "这个任务不存在或不属于你。" : "目前没有仍在处理、可供取消的任务。",
+        message.message_id,
+      );
+      return new Response("ok");
+    }
+
+    // Cancellation is idempotent: retrying after a Telegram reply failure will
+    // observe the same cancelled state and can safely resend the missing reply.
+    const result = await cancelTask(taskId, env);
+    await sendTelegramMessage(env, chatId, cancellationMessage(result), message.message_id);
     return new Response("ok");
+  } catch (error) {
+    if (claimed) {
+      try {
+        await releaseTelegramUpdate(env, update.update_id);
+      } catch (releaseError) {
+        console.error("Could not release failed control update claim", update.update_id, releaseError);
+      }
+    }
+    console.error("Telegram control update failed", update.update_id, error);
+    return new Response("temporary_failure", { status: 500 });
   }
-
-  if (!(await claimTelegramUpdate(env, update.update_id))) return new Response("ok");
-
-  if (isHelp) {
-    await sendTelegramMessage(env, chatId, helpText(), message.message_id);
-    return new Response("ok");
-  }
-
-  const targeted = hasCancelArgument(text);
-  const requestedTaskId = explicitTaskId(text);
-  if (targeted && !requestedTaskId) {
-    await sendTelegramMessage(
-      env,
-      chatId,
-      "任务 ID 格式不正确。请使用 `/cancel <完整 task-id>`，或直接发送 `/cancel` 取消最近仍在处理的任务。",
-      message.message_id,
-    );
-    return new Response("ok");
-  }
-
-  const taskId = await linkedTaskForUser(env, userId, requestedTaskId);
-  if (!taskId) {
-    await sendTelegramMessage(
-      env,
-      chatId,
-      requestedTaskId ? "这个任务不存在或不属于你。" : "目前没有仍在处理、可供取消的任务。",
-      message.message_id,
-    );
-    return new Response("ok");
-  }
-
-  const result = await cancelTask(taskId, env);
-  await sendTelegramMessage(env, chatId, cancellationMessage(result), message.message_id);
-  return new Response("ok");
 }

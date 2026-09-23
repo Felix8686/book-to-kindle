@@ -1,0 +1,52 @@
+Book to Kindle staging acceptance handoff
+
+Branch: stabilize/book-to-kindle-v1
+Cleanup code baseline: 4c559209253174645e177fb7853d9e41e68427e7 or later branch HEAD
+PR: #5 (Draft; do not merge yet)
+
+Evidence levels:
+1. CODE/SIMULATED PASS = static/unit/integration/mock evidence.
+2. LIVE-STAGING PASS = real staging Worker / D1 / Queue / R2 / Workers AI / Telegram execution.
+3. REAL-DELIVERY PASS = real Gmail -> Kindle last mile.
+
+Current confirmed status:
+- CODE_AND_SCHEMA: PASS. Typecheck/tests/local migration are CODE/SIMULATED; remote staging D1 migrations 0001-0013 are LIVE-STAGING.
+- TELEGRAM_IDENTITY: PASS (LIVE-STAGING). Production Bot was temporarily routed to staging for approved testing and restored to production.
+- ENTITY_FIDELITY_CORE_REGRESSION: PASS (LIVE-STAGING). The historical 纳尼亚传奇 -> 纽里亚主事书 mutation did not recur and no wrong task was created.
+- ENTITY_SCOPE_PRESERVATION: PASS (CODE/SIMULATED); current-HEAD Telegram live retest still not run.
+- TELEGRAM_TEXT_E2E: PASS (LIVE-STAGING).
+- CONTEXT: PASS (LIVE-STAGING).
+- SOURCE_RELEVANCE: PASS (LIVE-STAGING), including real Austen, Jane vs Jane Austen validation and wrong-title/wrong-author/no-result rejection.
+- HTTP_IDEMPOTENCY: PASS (LIVE-STAGING). Same Idempotency-Key returned the same task and one D1 mapping.
+- TASK_LEASE_ACQUISITION: PASS (LIVE-STAGING).
+- QUEUE_ACTIVE_LEASE_BLOCK: PASS (LIVE-STAGING). A real replay with an unexpired lease left task status/updated_at unchanged and did not replace the original lease token.
+- QUEUE_EXPIRED_LEASE_RECOVERY: PASS (LIVE-STAGING). After lease expiry the same real Queue replay was accepted, the consumer acquired execution, moved the task to needs_source, and released the lease row.
+- QUEUE_IDEMPOTENCY: PASS (LIVE-STAGING).
+- Initial Queue replay 1101 was caused by malformed manually inserted test request_json (json_valid=0) from command-line quoting, not by production queue code. Re-created valid JSON probe data passed live.
+- R2_WORKFLOW_PUT_GET: PASS (LIVE-STAGING). A legitimate/public-domain Pride and Prejudice EPUB was downloaded, staged into isolated R2, downloaded back, and validated.
+- R2_CANCEL_CLEANUP: PASS (LIVE-STAGING). Cancelling the staged task set D1 cancelled and removed the real R2 object; remote GET returned key-not-found.
+- Remaining R2 failure paths (missing/invalid/oversized/forced PUT failure): NOT_RUN (LIVE-STAGING) unless separately executed.
+- VISION_QWEN: NOT_RUN (LIVE-STAGING).
+- GMAIL_FENCE_SIMULATED: PASS (CODE/SIMULATED).
+- GMAIL_REAL_DELIVERY: BLOCKED_BY_GMAIL_SECRETS.
+- OVERALL: PARTIAL.
+
+Queue replay probe lifecycle:
+- A temporary API_TOKEN-protected, APP_ENV=staging-only POST /api/v1/_staging/queue/replay endpoint was added solely for Queue lease live acceptance.
+- It successfully completed both active-lease blocking and expired-lease recovery live tests.
+- The temporary endpoint was removed in commit 4c559209253174645e177fb7853d9e41e68427e7.
+- Do not reintroduce or deploy that test endpoint to production.
+
+Production protection:
+- Production Telegram webhook remains on the production Worker.
+- main has not been modified or merged.
+- PR #5 remains Draft.
+
+Remaining release gates:
+1. Verify clean post-probe-removal CI and redeploy cleaned HEAD to staging.
+2. Decide whether the remaining R2 live fault-injection cases are hard release gates or can remain CODE/SIMULATED for this release.
+3. If required, open one final short Telegram staging window for current-HEAD entity-scope retest and Qwen image E2E, then restore production immediately.
+4. Configure staging Gmail/Kindle credentials without exposing secrets.
+5. Perform one controlled legitimate/public-domain Gmail -> Kindle delivery.
+6. Prepare production schema upgrade / rollback evidence.
+7. Final production smoke/regression after explicit merge/deploy authorization.

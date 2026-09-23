@@ -2,444 +2,417 @@
 
 ## 1. Product intent
 
-Book to Kindle turns a short user intent into an asynchronous Kindle delivery task.
+Book to Kindle converts Telegram / HTTP requests into a cloud-hosted ebook discovery and Send-to-Kindle workflow.
 
-Supported execution modes:
+Cloudflare is the primary always-on runtime. A powered-on PC, Hermes, Docker, Calibre or a VPS is not required for the normal path.
 
-- **Cloud:** always-on Cloudflare deployment, usable while the user's PC is off.
-- **Local:** the same core Worker code through Wrangler, with optional access to heavyweight local tools.
+## 2. Non-negotiable boundaries
 
-The project must not require a VPS.
+1. Natural-language understanding belongs to the model.
+2. Deterministic facts and side effects belong to code.
+3. Webhooks stay lightweight; expensive AI/network work goes to Queue.
+4. Ebook bytes live temporarily in R2, never in D1 or Telegram.
+5. Ambiguous source results pause for user selection instead of blind delivery.
+6. Duplicate Queue delivery must not cause duplicate Gmail / Kindle delivery.
+7. An uncertain Gmail result must never trigger blind automatic resend.
+8. Model-generated title/author values are untrusted until grounded in user-visible evidence.
+9. Repository migrations must be able to reproduce every production D1 dependency.
+10. `main` is not considered stable merely because unit tests pass; real staging acceptance is mandatory.
 
-## 2. Hard constraints
-
-1. The always-on path should fit Cloudflare Free where practical.
-2. Docker/Calibre/native binaries must not be required by the Cloudflare core path.
-3. HTTP/Telegram webhook handlers stay lightweight; expensive work goes to Queue.
-4. Ebook bytes belong in R2, not D1 or Telegram.
-5. Images used for recognition are bounded and transient; the vision entry layer does not persist them.
-6. Heavy repair/conversion remains an optional local enhancement.
-7. Ambiguous recognition/search results require user selection rather than blind send.
-8. Entry, resolver, source and delivery mechanisms remain replaceable adapters/layers.
-9. Bundled download sources are chosen by the project owner for personal use. Project Gutenberg stays limited to public-domain records; the ZLibrary source (account-credentialed) serves the broader library the owner actually reads. No source is claimed as legal advice, and the operator is responsible for respecting each source's terms and applicable law.
-10. Delivery retry behavior prioritizes avoiding duplicate Kindle documents.
-11. Cloud operation must not depend on Hermes or a powered-on personal computer.
-12. Language preference is a ranking signal, not a hard availability filter.
-13. Semantic understanding belongs to the AI model; deterministic execution belongs to code (see §3). Regex/keyword/if-else stacks must not be added to avoid a model call, and code must not hand 100%-deterministic work to a model.
-
-## 3. Semantic / Deterministic Responsibility Boundary
-
-This is a standing architectural constraint for all future BookToKindle work, not a one-off rule for a specific bug.
-
-**1. The AI model owns semantic work — anything that requires understanding what the user actually means:**
-
-- user intent recognition (finding a book, asking for an author's works, asking for a recommendation, asking to send a book, chit-chat);
-- entity and entity-role recognition (who is the author, what is the title);
-- semantic distinction between titles / authors / series / work lists;
-- fuzzy natural-language understanding in any language;
-- language understanding that cannot be reliably solved by deterministic rules.
-
-**2. Ordinary code owns deterministic work:**
-
-API calls, data queries, state machines, downloads, queues, deduplication, validation, deterministic ranking rules, permissions, retries, timeouts, storage, format handling, and explicit structured-field handling.
-
-**3. Prohibited:** stacking regexes, keyword tables, `if/else` chains, special cases, or per-author/per-title hardcoding in order to avoid a model call. A keyword match that guesses intent will misroute natural language (for example, treating "which works did author X write" as a search for a book containing X's name).
-
-**4. Also prohibited:** handing work to the AI that code can complete with 100% determinism. Given structured intent, routing, verification, ordering and delivery stay in code.
-
-Simplified:
+## 3. Semantic vs deterministic responsibility
 
 ```text
-Semantic understanding -> Model
-Deterministic execution -> Code
+Natural-language understanding -> Workers AI
+Grounding / validation / facts / side effects -> deterministic code
 ```
 
-### Text semantic layer
+The model may decide:
 
-The Telegram text entry applies this boundary:
+- normal reply / clarification;
+- author works query;
+- book information query;
+- Kindle book task;
+- task status query.
 
-1. Explicit structured input (quoted titles, labeled author fields, declared format/language, `/send`) is parsed by existing deterministic code and never costs a model call.
-2. Any other free-form text is enqueued as a `telegram_text_semantic` Queue job. The consumer calls Workers AI (`SEMANTIC_TEXT_MODEL` env override, default `@cf/qwen/qwen2.5-7b-instruct`, JSON Mode) to map the message to structured intent: `find_book | author_works | send_book | unknown` plus `title` / `author` / `language` / `preferredFormat` / `confidence`.
-3. The model never searches, downloads, or controls business flow. Given its structured output, code routes:
-   - `find_book` / `send_book` with a title -> normal `BookRequest` download flow;
-   - `author_works` with an author -> deterministic author-catalog query (`src/catalog.ts`), which resolves the author to an Open Library author entity and returns only works verified by `author_key` membership — books that merely mention the author in their title/description/keywords can never be listed;
-   - `unknown` -> a clarification reply to the user.
-4. If the AI binding is not configured, the entry falls back to the legacy deterministic parser so the product still works without it.
+The model may not invent:
+
+- author work lists;
+- editions / ISBNs / publication metadata;
+- download availability;
+- task state;
+- delivery state.
+
+Those values come from code-backed data sources and D1.
+
+### Entity grounding
+
+A model classification is not enough to authorize an entity.
+
+Before `title` or `author` can drive a catalog query or book task, the normalized entity must occur in either:
+
+- the current user message; or
+- the bounded recent conversation history.
+
+Therefore a model output such as:
+
+```text
+user: 纳尼亚传奇
+model title: 纽里亚主事书
+```
+
+is rejected before search/task creation. The safe result is clarification, not a wrong downstream request.
+
+If a title is grounded but an optional author is not, the ungrounded author is discarded rather than allowed to contaminate search.
 
 ## 4. Runtime topology
 
 ```text
-                         Telegram
-                       /          \
-                  text             image
-                   |                 |
-                   |          Telegram adapter
-                   |                 |
-                   |        Queue: vision job
-                   |                 |
-                   |          Workers AI vision
-                   |                 |
-                   |      title/author or buttons
-                   |                 |
-                   +--------+--------+
-                            |
-Hermes / HTTP --------------+
-Other future entries -------+
-                            |
-                            v
-                        BookRequest
-                            |
-                            v
-                         D1 task
-                            |
-                            v
-                          Queue
-                            |
-                  effective language
-                            |
-                            v
-                  Work / Edition Resolver
-                Open Library + Google Books
-                            |
-                            v
-                    BookSearchContext
-                            |
-              +-------------+-------------+
-              |             |             |
-              v             v             v
-          Gutendex     Google Books     Internet Archive
-          Gutenberg       Free             Public
-              |             |             |
-              +-------------+-------------+
-                            |
-                    rank + deduplicate
-                            |
-                            v
-                     selected edition
-                            |
-                            v
-                           R2
-                            |
-                            v
-                     Gmail delivery
-                            |
-                            v
-                          Kindle
+Telegram
+  |
+  +-- deterministic commands (/send /status /settings /cancel ...)
+  |
+  +-- free-form text
+  |     -> webhook validation + update claim
+  |     -> D1 telegram_assistant_jobs
+  |     -> Queue: telegram_assistant_text
+  |     -> Workers AI assistant
+  |     -> entity grounding
+  |     -> code-backed reply/status/catalog OR BookRequest
+  |
+  +-- image
+        -> Queue: telegram_image
+        -> Workers AI Vision
+        -> recognized title / user selection
+        -> BookRequest
+
+HTTP POST /api/v1/tasks ----------------------+ 
+                                             |
+BookRequest ----------------------------------+
+                                             v
+                                            D1 task
+                                             |
+                                             v
+                                      Queue: book
+                                             |
+                                      execution lease
+                                             |
+                                             v
+                                  Work/edition resolver
+                              Open Library + Google Books
+                                             |
+                                             v
+                               SourceAdapter searches
+                        ZLibrary / Gutendex / Google / IA
+                                             |
+                                      relevance gate
+                                             |
+                                  rank + deduplicate
+                                             |
+                                   select / confirm
+                                             |
+                                           R2
+                                             |
+                                     delivery fence
+                                             |
+                                      Gmail API
+                                             |
+                                          Kindle
 ```
 
-Telegram talks directly to Cloudflare. Hermes is an optional client rather than a required relay.
+## 5. Telegram free-form text
 
-## 5. Unified request contract
+Free-form Telegram messages no longer run Workers AI inside the webhook.
 
-All entrypoints ultimately create the same request:
+The webhook:
 
-```json
-{
-  "query": "book title",
-  "author": "optional author",
-  "language": "optional explicit preference",
-  "preferredFormat": "epub"
+1. verifies Telegram secret;
+2. verifies private chat + allowed user;
+3. claims `telegram_updates.update_id`;
+4. creates `telegram_assistant_jobs` state;
+5. enqueues `telegram_assistant_text`;
+6. returns to Telegram quickly.
+
+The Queue consumer owns AI, catalog calls and the final reply.
+
+`telegram_assistant_jobs` persists enough information to make retry safe:
+
+- original `update_id` / source message;
+- input text;
+- processing lease;
+- reserved book `task_id` if one is created;
+- whether the book Queue message was confirmed enqueued;
+- final response text.
+
+If Telegram `sendMessage` fails, Queue can retry the reply without creating a second logical book task.
+
+If book Queue send succeeded but the worker crashed before recording that success, the assistant job may enqueue the same `task_id` again. This is safe because the book Queue has its own execution lease and the Gmail path has a permanent delivery fence.
+
+### Conversation context
+
+`telegram_conversation_messages` retains only a bounded recent history (12 messages per user/chat).
+
+It exists for contextual references such as:
+
+```text
+第二本怎么样？
+第二本发到 Kindle
+刚才那本发成功了吗？
+```
+
+It is not a long-term user profile store.
+
+## 6. Workers AI
+
+### Assistant text
+
+Default:
+
+```text
+@cf/meta/llama-3.3-70b-instruct-fp8-fast
+```
+
+Override:
+
+```text
+ASSISTANT_MODEL
+```
+
+Text output is structured JSON and then normalized + grounded before deterministic execution.
+
+### Vision
+
+Actual Vision model:
+
+```text
+@cf/qwen/qwen3.8-27b
+```
+
+`src/workers-ai.ts` is the only compatibility boundary for receiver-sensitive Workers AI calls. It also adapts the legacy image request shape into Qwen multimodal messages.
+
+Do not extract and invoke a bare `env.AI.run` without preserving its receiver.
+
+## 7. Unified BookRequest
+
+All delivery entrypoints converge on:
+
+```ts
+interface BookRequest {
+  query: string;
+  author?: string;
+  language?: string;
+  preferredFormat?: "epub" | "pdf";
 }
 ```
 
-`language` is an explicit per-task override when present. For Telegram tasks where it is absent, the saved Telegram user preference is used. If neither exists, the system fallback is `zh`.
-
-Telegram/image-specific metadata is not inserted into the core `TaskRecord`.
-
-## 6. Persistent Telegram preferences
-
-`user_settings` stores lightweight user-level book preferences:
+Language precedence for Telegram tasks:
 
 ```text
-user_id
-default_language
-preferred_format
-created_at
-updated_at
+explicit request
+> saved user setting
+> zh default
 ```
 
-Default behavior when no row exists:
+Language is a preference, not a hard availability filter.
 
-```text
-default_language = zh
-preferred_format = epub
-```
+## 8. Work / edition resolution
 
-Effective language precedence:
+Before source search, the worker builds `BookSearchContext` using:
 
-```text
-explicit request language
-> saved Telegram user setting
-> system default zh
-```
+- Open Library;
+- Google Books.
 
-This is a preference. A task may fall back to another language if no compatible preferred-language file exists.
+Identity may include:
 
-## 7. Telegram text adapter
+- canonical title;
+- verified title variants;
+- authors;
+- ISBN-10 / ISBN-13;
+- Open Library work keys;
+- Google volume IDs.
 
-The `/telegram/webhook` entrypoint:
+Unverified top search results must never inject unrelated ISBN/title/author metadata into the canonical identity.
 
-- validates `X-Telegram-Bot-Api-Secret-Token`;
-- accepts private chats only;
-- requires `TELEGRAM_ALLOWED_USER_IDS` for task creation/settings;
-- keeps `/whoami` available for bootstrap;
-- parses explicit structured requests deterministically and routes free-form text through the AI semantic layer (§3);
-- supports `/settings` and persistent `/language zh|en` controls;
-- persists requester/chat linkage separately in `telegram_task_links`;
-- converts source ambiguity into inline Telegram buttons;
-- supports conservative `/cancel` / `取消` / `撤回` task cancellation;
-- reports selected waiting/final states back to the original chat.
+Resolver failures are isolated; the original request remains a fallback identity.
 
-Telegram update replay is deduplicated through the shared `telegram_updates` table.
+## 9. Sources and relevance
 
-## 8. Telegram vision adapter
+Enabled source adapters:
 
-Image input does not change the core book workflow.
+- `zlibrary`
+- `gutendex`
+- `google-books-free`
+- `internet-archive-public`
 
-### Request path
+Every adapter is wrapped by the same deterministic relevance gate before candidates reach ranking.
 
-The webhook validates the authorized user, checks declared size and enqueues a `telegram_image` Queue job. Vision inference never blocks the webhook.
+A candidate is accepted when deterministic evidence supports it, primarily:
 
-The Queue consumer then:
+- matching ISBN/identifier; or
+- compatible title variant;
+- plus compatible requested author when an author was explicitly supplied.
 
-1. calls Telegram `getFile`;
-2. downloads the image with a strict size cap;
-3. validates JPEG/PNG/WebP signatures;
-4. invokes Cloudflare Workers AI;
-5. extracts up to five book candidates with confidence;
-6. either creates a normal `BookRequest` or asks the user to select a recognized title.
+This prevents a provider's loose search results from filling `needs_selection` with unrelated books.
 
-After a normal task exists, saved language preference is resolved exactly as for text input. An English cover does not force an English edition when the effective preference is `zh`.
+## 10. Candidate ranking
 
-### Vision model
+After the relevance gate, ranking considers:
 
-Current model:
-
-```text
-@cf/meta/llama-3.2-11b-vision-instruct
-```
-
-The model uses the Worker `AI` binding. JSON Mode is requested for structured bibliographic output. The integration contains a narrow type bridge because generated Workers TypeScript declarations may lag documented runtime fields.
-
-### Temporary image choice state
-
-`telegram_image_choices` stores only recognition/user/chat/candidate preference metadata and expiry. Records expire after 24 hours and are deleted after selection/cancellation. Source images are not stored in D1 or R2 by this layer.
-
-## 9. Work / Edition Resolver
-
-v0.5 introduces a resolver layer between raw user intent and download-source search.
-
-Its purpose is to establish a lightweight identity for the underlying work rather than treating the user-entered title as the only search string.
-
-Normalized identity contains:
-
-```text
-canonicalTitle
-authors
-known title variants
-languages
-ISBN-10 / ISBN-13
-Open Library work keys
-Google Books volume IDs
-```
-
-### Open Library
-
-Used for work identity, authors, ISBNs, work keys and edition relationships. For the strongest matching work, edition metadata is inspected so real language-specific edition titles can become search variants.
-
-### Google Books
-
-Used as an independent metadata resolver for titles, authors, language, ISBNs and volume identifiers.
-
-### Failure isolation
-
-Both resolver calls are independent. `Promise.allSettled` semantics mean one resolver failing does not abort the task. The original request always remains a fallback search identity.
-
-### No blind translation
-
-Cross-language discovery is based on bibliographic edition metadata. The resolver does not treat a machine translation of an English title as proof that a corresponding Chinese edition exists.
-
-## 10. BookSearchContext
-
-After resolution, download sources receive a normalized `BookSearchContext`:
-
-```text
-request
-preferredLanguage
-identity
-ordered queryVariants
-```
-
-Preferred-language edition titles are placed before neutral/original/fallback titles, but fallback titles remain available.
-
-This means:
-
-```text
-English input + saved zh
--> resolve underlying work
--> known zh edition titles first
--> original English title remains fallback
-```
-
-## 11. Download SourceAdapters
-
-Enabled v0.5 sources:
-
-### Gutendex / Project Gutenberg
-
-- requires `copyright=false` search results;
-- searches several resolved title variants;
-- provides EPUB/PDF candidates;
-- restricts downloads/redirects to `gutenberg.org` hosts;
-- enforces cloud byte limits.
-
-### Google Books Free
-
-- searches `filter=free-ebooks`;
-- only emits full/publicly downloadable records with actual EPUB/PDF download links;
-- preview-only results are not candidates;
-- download URLs/redirects are restricted to Google-owned content hosts.
-
-### Internet Archive Public
-
-- uses Open Library availability data;
-- only considers records marked `ebook_access=public`;
-- fetches Archive metadata;
-- rejects restricted items and private files;
-- emits public EPUB/PDF files only;
-- restricts downloads/redirects to Archive hosts.
-
-Additional source adapters remain optional. The cloud workflow must continue to operate if an optional source is unavailable.
-
-## 12. Multi-source ranking and deduplication
+1. identifier overlap;
+2. title / edition match;
+3. author match;
+4. preferred language;
+5. requested/default format;
+6. bounded source quality;
+7. cloud size constraints.
 
 Source response order never decides the winner.
 
-Candidate scoring considers:
+If the winner is not sufficiently stronger than alternatives, the task enters `needs_selection`.
 
-1. identifier/ISBN overlap with the resolved work;
-2. title/edition match;
-3. author match;
-4. effective language preference;
-5. requested/default format;
-6. bounded source-quality weighting;
-7. cloud file-size constraints.
+## 11. Book Queue execution lease
 
-Source quality cannot outweigh an obviously wrong work/language match.
+Cloudflare Queues may replay a message or deliver duplicate copies.
 
-Candidates are deduplicated across providers using ISBN + language + format when possible. Without a shared ISBN, the provider edition key remains part of the fallback key so distinct translations, publishers or revisions are not silently merged.
+`task_execution_leases` serializes execution per `task_id`:
 
-If the best result is not sufficiently stronger than alternatives, the task pauses at `needs_selection` instead of blindly sending.
+- the first consumer obtains a bounded lease;
+- concurrent copies are acknowledged without running the workflow;
+- a hard-crashed lease becomes recoverable after expiry;
+- normal processing releases the lease in `finally`.
 
-## 13. Queue model
+The lease reduces duplicated resolver/download work. It is not the final side-effect guarantee; Gmail's delivery fence is.
 
-`TASK_QUEUE` carries three lightweight job types:
+## 12. Delivery fence and crash recovery
 
-- `book` — resolution, source search, download and delivery;
-- `telegram_image` — image recognition before a book task exists;
-- `telegram_text_semantic` — AI intent parsing for free-form text before a book task exists (§3).
+Before the irreversible Gmail send, `GmailDelivery` creates one durable `delivery_fences` row for the task.
 
-Vision jobs are deliberately acknowledged after one attempt rather than auto-retried. Book jobs retain retry behavior for failures before delivery begins.
+States:
 
-If the Telegram webhook cannot enqueue a new text/image job, it removes any incomplete task/link created before that failure and releases the `update_id` claim so Telegram can safely retry. Claims are not released after a Queue send succeeds, preventing duplicate work when only the acknowledgement message fails.
+```text
+started
+accepted
+unknown
+```
 
-Resolver/source calls use bounded timeouts and isolated failures to prevent one external service from monopolizing the Queue job.
+Only one `task_id` can own a fence.
 
-## 14. Book task state machine
+### Duplicate execution
+
+If a replay reaches Gmail delivery again:
+
+- `accepted` -> return the persisted receipt, do not resend;
+- `started` / `unknown` -> block automatic resend.
+
+### Crash after Gmail accepted
+
+There is a critical crash window:
+
+```text
+Gmail accepts message
+-> worker crashes
+-> TaskRecord still says delivering
+```
+
+`DeliveryAdapter.recover()` reads the permanent fence. If it contains `accepted`, workflow repairs the task to `delivered` and cleans R2 rather than setting `delivery_unknown` or resending.
+
+If acceptance cannot be recovered, task becomes `delivery_unknown`.
+
+## 13. HTTP idempotency
+
+`POST /api/v1/tasks` accepts optional:
+
+```http
+Idempotency-Key: <1..128 chars>
+```
+
+`api_idempotency` maps one key to one task.
+
+If task creation succeeds but Queue enqueue fails, the task and reservation are rolled back and the endpoint returns `503`. A client may safely retry.
+
+Candidate selection similarly restores `needs_selection` if its Queue enqueue fails.
+
+## 14. Telegram control failure semantics
+
+Settings/help/status/cancellation paths use `telegram_updates` replay claims.
+
+For idempotent control operations, if the Telegram reply fails, the claim is released and the webhook returns a temporary failure so Telegram can retry the missing response.
+
+Free-form assistant text has stronger durable job state and therefore does not need to release the Telegram claim after Queue acceptance.
+
+Image Queue work remains intentionally conservative: once image work is confirmed enqueued, the update claim is retained so a missing acknowledgement cannot duplicate vision work.
+
+## 15. Task state machine
 
 ```text
 queued
-  |
-  v
-searching
-  |-------------------+
-  |                   |
-  v                   v
-needs_source      needs_selection
-                       |
-                       v
-                     queued
-                       |
-                       v
-                   downloading
-                       |
-                       v
-                     staged
-                       |
-                       v
-                   delivering
-                    /      \
-                   v        v
-             delivered   delivery_unknown
+  -> searching
+     -> needs_source
+     -> needs_selection -> queued
+     -> downloading
+        -> staged
+           -> delivering
+              -> delivered
+              -> delivery_unknown
 
-Any safely cancellable pre-delivery state -> cancelled
-Failures before delivery starts -> failed -> may retry
+pre-delivery cancellable states -> cancelled
+pre-delivery failures -> failed
 ```
 
-`cancelled` is persisted as a terminal control-plane state. In-flight Queue work re-reads D1 around resolver/search/download/staging/delivery boundaries and cannot overwrite a user cancellation.
+`delivery_unknown` is terminal for automatic delivery.
 
-`delivery_unknown` blocks automatic resend because Gmail may already have accepted the document.
+## 16. Storage responsibilities
 
-## 15. Delivery adapter
+### D1
 
-Gmail API -> Send to Kindle uses:
+- tasks/candidates/receipts
+- Telegram task links/update claims
+- user settings
+- image choices
+- conversation history
+- assistant Queue jobs
+- delivery fences
+- API idempotency
+- task execution leases
+- usage counters
 
-- refresh-token OAuth with `gmail.send`;
-- RFC 822 MIME;
-- media upload;
-- R2 as the staged ebook source;
-- persisted Gmail message/thread receipt after confirmed success.
+### R2
 
-The cloud ebook threshold defaults to 20 MiB and is conservatively capped below the mail limit.
+Only temporary ebook bytes.
 
-## 16. Cloudflare resource model
+### Queue
 
-- **Worker:** validation, routing and lightweight responses.
-- **Queue:** vision/resolution/search/download/delivery network work.
-- **Workers AI:** image-to-book metadata extraction.
-- **D1:** task, candidate, delivery receipt, Telegram linkage/idempotency, temporary image choices and lightweight user settings.
-- **R2:** temporary ebook bytes only.
+Current kinds:
 
-Default image guardrail is 4 MiB, with a hard 6 MiB cap in code.
+```text
+book
+telegram_image
+telegram_assistant_text
+```
 
-## 17. Optional catalog/source enhancements
+### Worker
 
-### Amazon catalog
+Validation, routing, lightweight API responses, Queue consumer.
 
-Amazon can be useful for commercial-edition metadata but is not required by v0.5. If enabled later, it should use a supported Amazon API with user-provided credentials. HTML scraping is not part of the architecture.
+## 17. Security model
 
-### Standard Ebooks / OAPEN
+- HTTP task API: bearer token.
+- Telegram webhook: Telegram secret-token header.
+- Telegram actions: explicit user allowlist.
+- Callback actions: original user/chat verification.
+- Source downloads: explicit host/access restrictions.
+- ZLibrary account credentials are restricted to trusted session domains and are not sent to third-party signed CDN hosts.
+- Secrets stay in Cloudflare secrets / local dev vars, never Git or D1.
+- Images are bounded and signature-validated and are not persisted by the recognition layer.
+- R2 keys are opaque and generated by the service.
 
-These remain candidates for future verified adapters. They are not hard dependencies of the current cloud path.
+## 18. Migration contract
 
-### Local enhancement node
+The current schema contract is migrations `0001` through `0013` in repository order.
 
-Future local-only responsibilities may include Shelfmark, Calibre/CWA repair/conversion, native format conversion, and files too large/complex for the cloud path. The Cloudflare path must remain useful when this node is offline.
+A deployment is invalid if production contains application-required schema not reproducible from this sequence.
 
-## 18. Security model
+## 19. Release gate
 
-- HTTP task API uses bearer-token authentication.
-- Telegram webhook uses its dedicated secret header.
-- Telegram actions require an explicit user allowlist.
-- Callback actions verify original user and chat.
-- Targeted cancellation verifies Telegram task ownership.
-- Telegram file URLs are generated internally from Telegram `file_id`.
-- Images are size-limited and signature-checked before AI inference.
-- Source adapters use explicit host/access constraints before downloadable candidates are accepted.
-- Secrets stay in Wrangler secrets / `.dev.vars`, never D1 or Git.
-- R2 keys remain opaque and non-user-controlled.
-- Unknown Gmail delivery outcomes never trigger blind resend.
+Unit tests and typecheck are necessary, not sufficient.
 
-## 19. Current and future entrypoints
-
-Current:
-
-- HTTP API;
-- Telegram text;
-- Telegram images.
-
-Planned:
-
-- Hermes Skill/MCP bridge;
-- browser/share-sheet bridge;
-- lightweight Web UI.
+Before merge/release, the exact branch build must be exercised in isolated Cloudflare staging with real Telegram, Workers AI, real sources and a controlled Gmail -> Kindle path, including duplicate/retry/failure scenarios.

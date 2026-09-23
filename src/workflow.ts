@@ -101,10 +101,6 @@ export function candidateDedupKey(candidate: BookCandidate): string {
   const language = normalizeLanguage(candidate.language) ?? "";
   const format = candidate.format.toLowerCase();
   if (isbn13 || isbn10) return `isbn:${isbn13 ?? isbn10}:${language}:${format}`;
-  // Without a shared edition identifier, matching title/author/language/format
-  // is not enough evidence that two provider records are the same edition.
-  // Preserve source-specific editions rather than silently discarding a
-  // different translation, publisher or revision.
   const edition = candidate.editionKey ?? `${candidate.source}:${candidate.id}`;
   return [
     normalizedText(candidate.title),
@@ -232,6 +228,15 @@ async function cleanupCancelledObject(env: Env, storageKey: string): Promise<voi
   }
 }
 
+async function cleanupDeliveredObject(env: Env, storageKey?: string): Promise<void> {
+  if (!storageKey) return;
+  try {
+    await env.FILES.delete(storageKey);
+  } catch (error) {
+    console.warn("Delivered task R2 cleanup failed", storageKey, error);
+  }
+}
+
 export interface WorkflowDependencies {
   env: Env;
   sources: SourceAdapter[];
@@ -246,10 +251,29 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
   if (String(task.status) === "cancelled") return;
   if (task.status === "delivered" || task.status === "delivery_unknown") return;
   if (task.status === "delivering") {
+    let recovered = null;
+    if (deps.delivery?.recover) {
+      try {
+        recovered = await deps.delivery.recover(task);
+      } catch (error) {
+        console.warn("Delivery receipt recovery failed", taskId, error);
+      }
+    }
+
+    if (recovered) {
+      await repo.update(taskId, {
+        status: "delivered",
+        deliveryReceipt: recovered,
+        errorMessage: null,
+      });
+      await cleanupDeliveredObject(deps.env, task.storageKey);
+      return;
+    }
+
     await repo.update(taskId, {
       status: "delivery_unknown",
       errorMessage:
-        "A previous Gmail delivery started but its final outcome is unknown. Automatic resend was blocked to avoid a duplicate Kindle document.",
+        "A previous delivery started but its final outcome could not be recovered. Automatic resend was blocked to avoid a duplicate Kindle document.",
     });
     return;
   }
@@ -406,12 +430,8 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
     });
     deliveryStarted = false;
 
-    try {
-      await deps.env.FILES.delete(storageKey);
-      activeStorageKey = undefined;
-    } catch (cleanupError) {
-      console.warn("Delivered task R2 cleanup failed", taskId, cleanupError);
-    }
+    await cleanupDeliveredObject(deps.env, storageKey);
+    activeStorageKey = undefined;
   } catch (error) {
     if (await isCancelled(repo, taskId)) {
       if (activeStorageKey) await cleanupCancelledObject(deps.env, activeStorageKey);
@@ -421,15 +441,35 @@ export async function processTask(taskId: string, deps: WorkflowDependencies): P
     const message = error instanceof Error ? error.message : "Unknown workflow failure";
     if (deliveryStarted) {
       try {
+        let recovered = null;
+        if (deps.delivery?.recover) {
+          try {
+            const latest = await repo.get(taskId);
+            if (latest) recovered = await deps.delivery.recover(latest);
+          } catch (recoveryError) {
+            console.warn("Delivery receipt recovery after error failed", taskId, recoveryError);
+          }
+        }
+
+        if (recovered) {
+          await repo.update(taskId, {
+            status: "delivered",
+            deliveryReceipt: recovered,
+            errorMessage: null,
+          });
+          if (activeStorageKey) await cleanupDeliveredObject(deps.env, activeStorageKey);
+          return;
+        }
+
         await repo.update(taskId, {
           status: "delivery_unknown",
           errorMessage:
-            `Gmail delivery started but its final outcome could not be confirmed: ${message}. ` +
+            `Delivery started but its final outcome could not be confirmed: ${message}. ` +
             "Automatic resend was blocked to avoid a duplicate Kindle document.",
         });
         return;
       } catch (stateError) {
-        console.error("Could not persist delivery_unknown state", taskId, stateError);
+        console.error("Could not persist delivery terminal state", taskId, stateError);
         throw error;
       }
     }
