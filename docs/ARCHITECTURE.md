@@ -85,7 +85,7 @@ Telegram
         -> recognized title / user selection
         -> BookRequest
 
-HTTP POST /api/v1/tasks ----------------------+ 
+HTTP POST /api/v1/tasks ----------------------+
                                              |
 BookRequest ----------------------------------+
                                              v
